@@ -1,0 +1,3 @@
+[submodule "kachaka-api"]
+	path = kachaka-api
+	url = https://github.com/pf-robotics/kachaka-api.git

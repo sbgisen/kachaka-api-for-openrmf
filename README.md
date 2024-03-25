@@ -1,7 +1,8 @@
-# Kachaka-Zenoh Integration
+# Kachaka-Zenoh
 
 ## Brief Description
-Kachaka-Zenoh Integration is a powerful software solution designed to bridge the gap between the Kachaka API and Zenoh networking layer, facilitating seamless communication and data exchange in robotics applications. This project enables efficient, real-time robot management by publishing crucial robot data to Zenoh topics and subscribing to commands intended for robotic control.
+Kachaka-Zenoh Integration is a powerful software solution designed to bridge the gap between the Kachaka API and Zenoh networking layer, facilitating seamless communication and data exchange in robotics applications. 
+This project enables efficient, real-time robot management by publishing crucial robot data to Zenoh topics and subscribing to commands intended for robotic control.
 
 ## Features
 - **Real-Time Data Publishing**: Publishes robot's pose, current map name, and command state to specific Zenoh topics.
@@ -23,24 +24,39 @@ Kachaka-Zenoh Integration is a powerful software solution designed to bridge the
     pipenv run python -m grpc_tools.protoc -I kachaka-api/protos --python_out=. --grpc_python_out=. kachaka-api/protos/kachaka-api.proto 
     ```
 
-## Usage Examples
+
+## Connect to Zenoh
+### Usage Examples
 To run the Kachaka-Zenoh Integration script and start publishing data to Zenoh while listening for commands, use the following command:
 
 ```
-pipenv run python connect_openrmf_by_zenoh.py --zenoh_router_ip <router_ip> --zenoh_router_port <router_port> --kachaka_access_point <api_endpoint> --robot_name <name>
+pipenv run python scripts/connect_openrmf_by_zenoh.py --zenoh_router_ip <router_ip> --zenoh_router_port <router_port> --kachaka_access_point <api_endpoint> --robot_name <name>
 ```
 Replace `<router_ip>`, `<router_port>`, `<api_endpoint>`, and `<name>` with your Zenoh router's IP and port, the Kachaka API endpoint, and the name of your robot, respectively.
 
 If you want to show `help`, use the following command:
 
 ```
-pipenv run python connect_openrmf_by_zenoh.py -h
+pipenv run python scripts/connect_openrmf_by_zenoh.py -h
 ```
 
-## Configuration Options
+### Configuration Options
 - **Zenoh Router IP and Port**: Specify the IP address and port of your Zenoh router using `--zenoh_router_ip` and `--zenoh_router_port`.
 - **Kachaka Access Point**: Define the Kachaka API server URL with `--kachaka_access_point`.
 - **Robot Name**: Set a unique name for your robot using `--robot_name`, which will be used in Zenoh topic names.
+
+## REST API
+
+### Usage Examples
+To run the REST api for kachaka scripts, use the following command:
+
+```
+pipenv run python scripts/rest_kachaka_api.py --kachaka_access_point <api_endpoint>
+```
+Replace `<api_endpoint>` with your the Kachaka API endpoint, respectively.
+
+### Configuration Options
+- **Kachaka Access Point**: Define the Kachaka API server URL with `--kachaka_access_point`.
 
 ## License
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.

@@ -31,12 +31,10 @@ from zenoh import Sample
 
 class KachakaApiClientByZenoh:
     """A client for the Kachaka API that publishes data to Zenoh.
-
     This class connects to a Kachaka API server and a Zenoh router,
     and provides methods to publish the robot's pose, current map name,
     and command state to Zenoh topics. It also subscribes to a command
     topic to receive and execute commands.
-
     Args:
         zenoh_router (str): The address of the Zenoh router to connect to,
             in the format "ip:port".
@@ -56,11 +54,9 @@ class KachakaApiClientByZenoh:
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
-
         Args:
             zenoh_router (str): The address of the Zenoh router to connect to,
                 in the format "ip:port".
-
         Returns:
             zenoh.Config: A Zenoh configuration object.
         """
@@ -68,14 +64,12 @@ class KachakaApiClientByZenoh:
         conf.insert_json5(zenoh.config.CONNECT_KEY, json.dumps([f"tcp/{zenoh_router}"]))
         return conf
 
-    async def run_method(self, method_name: str, args: dict = None) -> Any:
+    async def run_method(self, method_name: str, args: dict = {}) -> Any:
         """Run a KachakaApiClient method with the provided arguments.
-
         Args:
             method_name (str): The name of the method to run.
             args (dict, optional): The arguments to pass to the method.
                 Defaults to None.
-
         Returns:
             Any: The result of the method call, converted to a dictionary
                 or list if it is a protobuf message.
@@ -106,11 +100,9 @@ class KachakaApiClientByZenoh:
                  response: Union[dict, list, RepeatedCompositeContainer, object]
                  ) -> Union[dict, list, RepeatedCompositeContainer]:
         """Convert a response object to a dictionary or list.
-
         Args:
             response (Union[dict, list, RepeatedCompositeContainer, object]):
                 The response object to convert.
-
         Returns:
             Union[dict, list, RepeatedCompositeContainer]: The converted
                 response object.
@@ -123,14 +115,11 @@ class KachakaApiClientByZenoh:
 
     def _command_callback(self, sample: Sample) -> None:
         """Handle received command samples.
-
         This method is called whenever a command is received on the subscribed
         Zenoh topic. It parses the command JSON, validates it, and runs the
         specified method with the provided arguments.
-
         Args:
             sample (Sample): The received Zenoh sample containing the command.
-
         Raises:
             ValueError: If the command structure is invalid.
             AttributeError: If the specified method does not exist on the
@@ -151,7 +140,6 @@ class KachakaApiClientByZenoh:
 
     def subscribe_command(self) -> zenoh.Subscriber:
         """Subscribe to the command topic.
-
         Returns:
             zenoh.Subscriber: The Zenoh subscriber object.
         """
@@ -161,7 +149,6 @@ class KachakaApiClientByZenoh:
 
 def main() -> None:
     """The main function to run the KachakaApiClientByZenoh.
-
     This function parses command-line arguments, creates an instance of
     KachakaApiClientByZenoh, subscribes to the command topic, and publishes
     the robot's pose, current map name, and command state to Zenoh in a loop.

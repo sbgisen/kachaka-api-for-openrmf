@@ -1,65 +1,103 @@
-# Kachaka-Zenoh
+# Kachaka API for Open RMF
 
 ## Brief Description
-Kachaka-Zenoh Integration is a powerful software solution designed to bridge the gap between the Kachaka API and Zenoh networking layer, facilitating seamless communication and data exchange in robotics applications. 
-This project enables efficient, real-time robot management by publishing crucial robot data to Zenoh topics and subscribing to commands intended for robotic control.
+Kachaka API for Open RMF is a software integration that connects the Kachaka API with the Open RMF (Robotics Middleware Framework) using Zenoh, a data-centric communication protocol. This project enables seamless communication and control of Kachaka robots within the Open RMF ecosystem.
 
 ## Features
-- **Real-Time Data Publishing**: Publishes robot's pose, current map name, and command state to specific Zenoh topics.
-- **Command Subscription**: Listens for and executes commands received on a Zenoh topic designated for robot control.
-- **Asynchronous Support**: Utilizes asyncio for non-blocking network communications, ensuring responsive robot operations.
-- **Protobuf Integration**: Uses Protocol Buffers for efficient data serialization, catering to robust and scalable applications.
-- **Easy Configuration**: Offers straightforward setup with customizable options for Zenoh router connections and Kachaka API endpoints.
+- Integration of Kachaka API with Open RMF using Zenoh
+- Publishing of robot pose, current map name, and command state to Zenoh topics
+- Subscription to command topic for receiving and executing robot commands
+- Asynchronous communication using asyncio for responsive robot control
+- Easy configuration of Zenoh router and Kachaka API endpoints
+- REST API for interacting with the Kachaka API using HTTP requests
+- Web-based demo for remote control and monitoring of Kachaka robots
 
 ## Installation Instructions
-1. **Clone the Repository**: Start by cloning the repository to your local machine.
-    ```
-    git clone https://github.com/your-repository/kachaka-zenoh.git
-    ```
-2. **Install Dependencies**: Navigate to the cloned directory and install the necessary Python dependencies.
-    ```
-    cd kachaka-zenoh
-    pipenv install
-    pipenv run pip install eclipse-zenoh
-    pipenv run python -m grpc_tools.protoc -I kachaka-api/protos --python_out=. --grpc_python_out=. kachaka-api/protos/kachaka-api.proto 
-    ```
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/sbgisen/kachaka-api-for-openrmf.git --recursive
+   ```
 
+2. Navigate to the project directory:
+   ```bash
+   cd kachaka-api-for-openrmf
+   ```
+
+3. Install the required dependencies using Pipenv:
+   ```bash
+   pipenv install
+   ```
+
+4. Install the Zenoh Python package:
+   ```bash
+   pipenv run pip install eclipse-zenoh
+   ```
+
+5. Generate Python code from the Kachaka API protobuf file:
+   ```bash
+   pipenv run python -m grpc_tools.protoc -I kachaka-api/protos --python_out=. --grpc_python_out=. kachaka-api/protos/kachaka-api.proto
+   ```
 
 ## Connect to Zenoh
+
 ### Usage Examples
-To run the Kachaka-Zenoh Integration script and start publishing data to Zenoh while listening for commands, use the following command:
+To run the Kachaka API for Open RMF integration script and start publishing data to Zenoh while listening for commands, use the following command:
 
 ```
 pipenv run python scripts/connect_openrmf_by_zenoh.py --zenoh_router_ip <router_ip> --zenoh_router_port <router_port> --kachaka_access_point <api_endpoint> --robot_name <name>
 ```
+
 Replace `<router_ip>`, `<router_port>`, `<api_endpoint>`, and `<name>` with your Zenoh router's IP and port, the Kachaka API endpoint, and the name of your robot, respectively.
 
-If you want to show `help`, use the following command:
+To display the help message and available options, use the following command:
 
 ```
 pipenv run python scripts/connect_openrmf_by_zenoh.py -h
 ```
 
+### Sending Commands
+To send commands to the robot via Zenoh, publish a JSON-formatted message to the `kachaka/<robot_name>/command` topic with the following structure:
+
+```json
+{
+  "method": "<method_name>",
+  "args": {
+    "arg1": "value1",
+    "arg2": "value2"
+  }
+}
+```
+
 ### Configuration Options
-- **Zenoh Router IP and Port**: Specify the IP address and port of your Zenoh router using `--zenoh_router_ip` and `--zenoh_router_port`.
-- **Kachaka Access Point**: Define the Kachaka API server URL with `--kachaka_access_point`.
-- **Robot Name**: Set a unique name for your robot using `--robot_name`, which will be used in Zenoh topic names.
+- `--zenoh_router_ip`: Specify the IP address of your Zenoh router (default: "192.168.1.1").
+- `--zenoh_router_port`: Specify the port of your Zenoh router (default: "7447").
+- `--kachaka_access_point`: Define the Kachaka API server URL (default: "").
+- `--robot_name`: Set a unique name for your robot (default: "robot").
 
 ## REST API
 
 ### Usage Examples
-To run the REST api for kachaka scripts, use the following command:
+To start the REST API server, use the following command:
 
 ```
 pipenv run python scripts/rest_kachaka_api.py --kachaka_access_point <api_endpoint>
 ```
-Replace `<api_endpoint>` with your the Kachaka API endpoint, respectively.
+
+Replace `<api_endpoint>` with your Kachaka API endpoint.
+
+### REST API Server
+The server will start running on `http://localhost:26502`. You can then send HTTP requests to interact with the Kachaka API.
+
+Example requests:
+- `GET /kachaka/front_camera_image.jpeg`: Get the latest front camera image.
+- `GET /kachaka/get_robot_pose`: Get the current robot pose.
+- `POST /kachaka/move_to_location {"target_location_id": "location1"}`: Move the robot to a specific location.
 
 ### Configuration Options
-- **Kachaka Access Point**: Define the Kachaka API server URL with `--kachaka_access_point`.
+- `--kachaka_access_point`: Define the Kachaka API server URL (default: "localhost:26400").
 
 ## License
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for more details.
 
-## Acknowledgements/Credits
-Special thanks to all contributors and the robotics community for their valuable insights and feedback that have greatly shaped this project.
+## Acknowledgements
+We would like to express our gratitude to the Open RMF community for their valuable contributions and support in making this integration possible.

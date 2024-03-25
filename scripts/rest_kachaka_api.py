@@ -19,8 +19,6 @@ import argparse
 import asyncio
 import io
 from typing import Any
-from typing import Awaitable
-from typing import Callable
 from typing import Dict
 from typing import Union
 
@@ -29,12 +27,9 @@ import uvicorn
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import HTTPException
-from fastapi import Request
 from fastapi.responses import StreamingResponse
 from google._upb._message import RepeatedCompositeContainer
 from google.protobuf.json_format import MessageToDict
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
 background_task_results: Dict[str, Any] = {}
 
@@ -47,20 +42,17 @@ kachaka_access_point = parser.parse_args().kachaka_access_point
 kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
 
 
-class StartupMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to initialize Kachaka API client on startup.
-    """
-
-    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        if not hasattr(self, 'initialized'):
-            await kachaka_client.update_resolver()
-            self.initialized = True
-        response = await call_next(request)
-        return response
+@app.on_event("startup")
+async def init_channel() -> None:
+    global kachaka_client
+    loop = asyncio.get_event_loop()
+    asyncio.set_event_loop(loop)
+    kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
+    asyncio.create_task(update_resolver())
 
 
-app.add_middleware(StartupMiddleware)
+async def update_resolver() -> None:
+    await kachaka_client.update_resolver()
 
 
 def to_dict(response: Any) -> Union[dict, list]:

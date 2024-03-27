@@ -18,6 +18,7 @@
 import argparse
 import asyncio
 import io
+import os
 from typing import Any
 from typing import Dict
 from typing import Union
@@ -48,7 +49,8 @@ async def init_channel() -> None:
     Initialize the Kachaka API client.
     """
     global kachaka_client
-    kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
+    kachaka_client = kachaka_api.aio.KachakaApiClient(
+        os.getenv("KACHAKA_ACCESS_POINT", "localhost:26400"))
     await kachaka_client.update_resolver()
 
 

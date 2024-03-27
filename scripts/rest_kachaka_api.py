@@ -15,8 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
-import asyncio
 import io
 import os
 from typing import Any
@@ -24,7 +22,6 @@ from typing import Dict
 from typing import Union
 
 import kachaka_api
-import uvicorn
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -35,12 +32,6 @@ from google.protobuf.json_format import MessageToDict
 background_task_results: Dict[str, Any] = {}
 
 app = FastAPI()
-
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--kachaka_access_point", "-ka", help="Kachaka access point", default="localhost:26400")
-kachaka_access_point = parser.parse_args().kachaka_access_point
-kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
 
 
 @app.on_event("startup")
@@ -174,10 +165,3 @@ def get_command_result(task_id: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="Task not found or not completed")
     return result
-
-
-config = uvicorn.Config(app)
-config.host = "0.0.0.0"
-config.port = 26502
-server = uvicorn.Server(config)
-asyncio.run(server.serve())

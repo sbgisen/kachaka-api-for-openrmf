@@ -28,12 +28,7 @@ Kachaka API for Open RMF is a software integration that connects the Kachaka API
    pipenv install
    ```
 
-4. Install the Zenoh Python package:
-   ```bash
-   pipenv run pip install eclipse-zenoh
-   ```
-
-5. Generate Python code from the Kachaka API protobuf file:
+4. Generate Python code from the Kachaka API protobuf file:
    ```bash
    pipenv run python -m grpc_tools.protoc -I kachaka-api/protos --python_out=. --grpc_python_out=. kachaka-api/protos/kachaka-api.proto
    ```

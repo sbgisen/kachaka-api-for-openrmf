@@ -44,14 +44,11 @@ kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
 
 @app.on_event("startup")
 async def init_channel() -> None:
+    """
+    Initialize the Kachaka API client.
+    """
     global kachaka_client
-    loop = asyncio.get_event_loop()
-    asyncio.set_event_loop(loop)
     kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
-    asyncio.create_task(update_resolver())
-
-
-async def update_resolver() -> None:
     await kachaka_client.update_resolver()
 
 

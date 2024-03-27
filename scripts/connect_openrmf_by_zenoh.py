@@ -64,7 +64,7 @@ class KachakaApiClientByZenoh:
         conf.insert_json5(zenoh.config.CONNECT_KEY, json.dumps([f"tcp/{zenoh_router}"]))
         return conf
 
-    async def run_method(self, method_name: str, args: dict = {}) -> Any:
+    async def run_method(self, method_name: str, args: dict = {}) -> Any:  # noqa: ANN401
         """Run a KachakaApiClient method with the provided arguments.
         Args:
             method_name (str): The name of the method to run.

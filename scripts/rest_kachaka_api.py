@@ -54,7 +54,7 @@ async def init_channel() -> None:
     await kachaka_client.update_resolver()
 
 
-def to_dict(response: Any) -> Union[dict, list]:
+def to_dict(response: Any) -> Union[dict, list]:  # noqa: ANN401
     """
     Convert a Protobuf response to a dictionary.
 

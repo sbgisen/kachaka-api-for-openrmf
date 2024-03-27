@@ -108,12 +108,9 @@ async def front_or_back_camera_image(front_or_back: str) -> StreamingResponse:
     Raises:
         HTTPException: If the specified camera is not "front" or "back".
     """
-    if front_or_back == "front":
-        response = await kachaka_client.get_front_camera_ros_compressed_image()
-    elif front_or_back == "back":
-        response = await kachaka_client.get_back_camera_ros_compressed_image()
-    else:
+    if front_or_back not in ["front", "back"]:
         raise HTTPException(status_code=404, detail="Camera not found")
+    response = await run_method_or_404(f"get_{front_or_back}_camera_ros_compressed_image")
     image_data = response.data
     image_format = response.format
     image_bytes = io.BytesIO(image_data)
@@ -131,7 +128,7 @@ async def get(method: str) -> dict:
     Returns:
         The response from the method as a dictionary.
     """
-    return await run_method_or_404(method, {})
+    return await run_method_or_404(method)
 
 
 @app.post("/kachaka/{method:path}")

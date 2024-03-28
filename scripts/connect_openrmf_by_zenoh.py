@@ -35,14 +35,16 @@ class KachakaApiClientByZenoh:
     and provides methods to publish the robot's pose, current map name,
     and command state to Zenoh topics. It also subscribes to a command
     topic to receive and execute commands.
-    Args:
-        zenoh_router (str): The address of the Zenoh router to connect to,
-            in the format "ip:port".
-        kachaka_access_point (str): The URL of the Kachaka API server.
-        robot_name (str): The name of the robot, used in Zenoh topic names.
     """
 
     def __init__(self, zenoh_router: str, kachaka_access_point: str, robot_name: str) -> None:
+        """Constructor method.
+        Args:
+            zenoh_router (str): The address of the Zenoh router to connect to,
+                in the format "ip:port".
+            kachaka_access_point (str): The URL of the Kachaka API server.
+            robot_name (str): The name of the robot, used in Zenoh topic names.
+        """
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
 

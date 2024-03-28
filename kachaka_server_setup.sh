@@ -5,15 +5,23 @@ if [ $# -eq 0 ]; then
   echo "Provide the IP address of the server."
   exit 1
 fi
-# Function for cleaning up temporary files
+# Function for cleaning up temporary files.
 cleanup() {
   echo "Cleaning up temporary files..."
   rm -f kachaka_startup.sh
 }
+# Clean up temporary files on exit.
 trap cleanup EXIT
 # Get argument and set as KACHAKA_IP.
 KACHAKA_IP=$1
 SSH_PORT=26500
+
+timeout=3  # Timeout in seconds
+if ! nc -z -w $timeout $KACHAKA_IP $SSH_PORT; then
+    echo "SSH port on $KACHAKA_IP:$SSH_PORT is not accessible, configure the server to allow SSH connections on port."
+    echo "See https://github.com/pf-robotics/kachaka-api?tab=readme-ov-file#playground%E3%81%ABssh%E3%81%A7%E3%83%AD%E3%82%B0%E3%82%A4%E3%83%B3%E3%81%99%E3%82%8B"
+    exit 1
+fi
 RUN_LINE="jupyter-lab --port=26501 --ip='0.0.0.0' & uvicorn sbgisen.rest_kachaka_api:app --host 0.0.0.0 --port 26502"
 # Ask whether to set up Zenoh client. If yes, ask the router access point and the robot name.
 read -p "Do you want to set up the Zenoh client? (y/n) " -n 1 -r

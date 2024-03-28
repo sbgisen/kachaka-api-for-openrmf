@@ -66,16 +66,17 @@ def to_dict(response: Any) -> Union[dict, list]:  # noqa: ANN401
     return response
 
 
-async def run_method_or_404(attr: str, params: dict = {}) -> dict:
+async def run_method_or_404(attr: str, params: dict = {}, to_dict: bool = True) -> Any:  # noqa: ANN401
     """
     Run a method on the Kachaka API client or raise a 404 error if the method does not exist.
 
     Args:
         attr (str): The name of the method to run.
         params (dict): The arguments to pass to the method.
+        to_dict (bool): Whether to convert the response to a dictionary.
 
     Returns:
-        The response from the method as a dictionary.
+        The response from the method or the response converted to a dictionary.
 
     Raises:
         HTTPException: If the method does not exist.
@@ -84,7 +85,7 @@ async def run_method_or_404(attr: str, params: dict = {}) -> dict:
         raise HTTPException(status_code=404, detail="Method not found")
     method = getattr(kachaka_client, attr)
     response = await method(**params)
-    return to_dict(response)
+    return to_dict(response) if to_dict else response
 
 
 @app.get("/kachaka/{front_or_back}_camera_image.jpeg")
@@ -103,7 +104,7 @@ async def front_or_back_camera_image(front_or_back: str) -> StreamingResponse:
     """
     if front_or_back not in ["front", "back"]:
         raise HTTPException(status_code=404, detail="Camera not found")
-    response = await run_method_or_404(f"get_{front_or_back}_camera_ros_compressed_image")
+    response = await run_method_or_404(f"get_{front_or_back}_camera_ros_compressed_image", to_dict=False)
     image_data = response.data
     image_format = response.format
     image_bytes = io.BytesIO(image_data)

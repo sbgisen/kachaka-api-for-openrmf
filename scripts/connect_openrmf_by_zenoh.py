@@ -15,9 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
 import asyncio
 import json
+import os
 import time
 from typing import Any
 from typing import Union
@@ -155,16 +155,13 @@ def main() -> None:
     KachakaApiClientByZenoh, subscribes to the command topic, and publishes
     the robot's pose, current map name, and command state to Zenoh in a loop.
     """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--zenoh_router_ip", "-zi", default="192.168.1.1", help="Zenoh router IP")
-    parser.add_argument("--zenoh_router_port", "-zp", default="7447", help="Zenoh router port")
-    parser.add_argument("--kachaka_access_point", "-ka", default="", help="Kachaka access point")
-    parser.add_argument("--robot_name", "-rn", default="robot", help="Robot name")
-    args = parser.parse_args()
+    zenoh_router_ap = os.getenv('ZENOH_ROUTER_ACCESS_POINT')
+    kachaka_access_point = os.getenv('KACHAKA_ACCESS_POINT')
+    robot_name = os.getenv('ROBOT_NAME', 'kachaka')
+    if not zenoh_router_ap or not kachaka_access_point:
+        raise ValueError("ZENOH_ROUTER_ACCESS_POINT and KACHAKA_ACCESS_POINT must be set as environment variables.")
 
-    zenoh_router = f"{args.zenoh_router_ip}:{args.zenoh_router_port}"
-
-    node = KachakaApiClientByZenoh(zenoh_router, args.kachaka_access_point, args.robot_name)
+    node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name)
     try:
         sub = node.subscribe_command()
         print(f"Subscribed to {sub}")
@@ -174,7 +171,7 @@ def main() -> None:
             asyncio.run(node.publish_result())
             time.sleep(1)
     except KeyboardInterrupt:
-        node.session.delete(f"kachaka/{args.robot_name}/**")
+        node.session.delete(f"kachaka/{robot_name}/**")
         node.session.close()
 
 

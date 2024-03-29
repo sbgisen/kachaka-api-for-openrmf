@@ -62,7 +62,7 @@ Run the following lines to launch the REST API server.
 ```bash
 cd ~/kachaka_ws
 export KACHAKA_ACCESS_POINT=$KACHAKA_IP:26400
-PYTHONPATH="/home/gisen/work/kachaka-api-for-openrmf/scripts:$PYTHONPATH" pipenv run uvicorn rest_kachaka_api:app --host 0.0.0.0 --port 26502
+PYTHONPATH="/path/to/kachaka-api-for-openrmf/scripts:$PYTHONPATH" pipenv run uvicorn rest_kachaka_api:app --host 0.0.0.0 --port 26502
 ```
 
 The server will start running on `http://localhost:26502`. You can then send HTTP requests to interact with the Kachaka API.

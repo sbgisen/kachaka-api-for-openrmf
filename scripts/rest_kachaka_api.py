@@ -15,15 +15,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
-import asyncio
 import io
+import os
 from typing import Any
 from typing import Dict
 from typing import Union
 
 import kachaka_api
-import uvicorn
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -35,27 +33,19 @@ background_task_results: Dict[str, Any] = {}
 
 app = FastAPI()
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--kachaka_access_point", "-ka", help="Kachaka access point", default="localhost:26400")
-kachaka_access_point = parser.parse_args().kachaka_access_point
-kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
-
 
 @app.on_event("startup")
 async def init_channel() -> None:
+    """
+    Initialize the Kachaka API client.
+    """
     global kachaka_client
-    loop = asyncio.get_event_loop()
-    asyncio.set_event_loop(loop)
-    kachaka_client = kachaka_api.aio.KachakaApiClient(kachaka_access_point)
-    asyncio.create_task(update_resolver())
-
-
-async def update_resolver() -> None:
+    kachaka_client = kachaka_api.aio.KachakaApiClient(
+        os.getenv("KACHAKA_ACCESS_POINT", "localhost:26400"))
     await kachaka_client.update_resolver()
 
 
-def to_dict(response: Any) -> Union[dict, list]:
+def to_dict(response: Any) -> Union[dict, list]:  # noqa: ANN401
     """
     Convert a Protobuf response to a dictionary.
 
@@ -76,16 +66,17 @@ def to_dict(response: Any) -> Union[dict, list]:
     return response
 
 
-async def run_method_or_404(attr: str, params: dict = {}) -> dict:
+async def run_method_or_404(attr: str, params: dict = {}, to_dict: bool = True) -> Any:  # noqa: ANN401
     """
     Run a method on the Kachaka API client or raise a 404 error if the method does not exist.
 
     Args:
         attr (str): The name of the method to run.
         params (dict): The arguments to pass to the method.
+        to_dict (bool): Whether to convert the response to a dictionary.
 
     Returns:
-        The response from the method as a dictionary.
+        The response from the method or the response converted to a dictionary.
 
     Raises:
         HTTPException: If the method does not exist.
@@ -94,7 +85,7 @@ async def run_method_or_404(attr: str, params: dict = {}) -> dict:
         raise HTTPException(status_code=404, detail="Method not found")
     method = getattr(kachaka_client, attr)
     response = await method(**params)
-    return to_dict(response)
+    return to_dict(response) if to_dict else response
 
 
 @app.get("/kachaka/{front_or_back}_camera_image.jpeg")
@@ -111,12 +102,9 @@ async def front_or_back_camera_image(front_or_back: str) -> StreamingResponse:
     Raises:
         HTTPException: If the specified camera is not "front" or "back".
     """
-    if front_or_back == "front":
-        response = await kachaka_client.get_front_camera_ros_compressed_image()
-    elif front_or_back == "back":
-        response = await kachaka_client.get_back_camera_ros_compressed_image()
-    else:
+    if front_or_back not in ["front", "back"]:
         raise HTTPException(status_code=404, detail="Camera not found")
+    response = await run_method_or_404(f"get_{front_or_back}_camera_ros_compressed_image", to_dict=False)
     image_data = response.data
     image_format = response.format
     image_bytes = io.BytesIO(image_data)
@@ -134,7 +122,7 @@ async def get(method: str) -> dict:
     Returns:
         The response from the method as a dictionary.
     """
-    return await run_method_or_404(method, {})
+    return await run_method_or_404(method)
 
 
 @app.post("/kachaka/{method:path}")
@@ -178,10 +166,3 @@ def get_command_result(task_id: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="Task not found or not completed")
     return result
-
-
-config = uvicorn.Config(app)
-config.host = "0.0.0.0"
-config.port = 26502
-server = uvicorn.Server(config)
-asyncio.run(server.serve())

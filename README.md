@@ -38,6 +38,9 @@ After rebooting the device, you shall get a response by running commands such as
 
 ```bash
 curl http://$KACHAKA_IP:26502/kachaka/get_robot_pose
+# {"get_robot_pose":{"x":-0.27050725751488025,"y":0.06214801113488019,"theta":0.09612629786430153}}
+curl http://$KACHAKA_IP:26502/kachaka/get_map_list
+# {"get_map_list":[{"name":"1F","id":"XXX"},{"name":"2F","id":"YYY"}]}
 ```
 
 ## Local development

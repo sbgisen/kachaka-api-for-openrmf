@@ -45,9 +45,9 @@ async def init_channel() -> None:
     await kachaka_client.update_resolver()
 
 
-def to_dict(response: Any) -> Union[dict, list]:  # noqa: ANN401
+def convert_response(response: Any) -> Union[dict, list]:  # noqa: ANN401
     """
-    Convert a Protobuf response to a dictionary.
+    Convert a Protobuf response to a dictionary or a list.
 
     Args:
         response: The Protobuf response to convert.
@@ -62,7 +62,7 @@ def to_dict(response: Any) -> Union[dict, list]:  # noqa: ANN401
         or isinstance(response, list)
         or isinstance(response, RepeatedCompositeContainer)
     ):
-        return [to_dict(r) for r in response]
+        return [convert_response(r) for r in response]
     return response
 
 
@@ -85,7 +85,7 @@ async def run_method_or_404(attr: str, params: dict = {}, to_dict: bool = True) 
         raise HTTPException(status_code=404, detail="Method not found")
     method = getattr(kachaka_client, attr)
     response = await method(**params)
-    return to_dict(response) if to_dict else response
+    return convert_response(response) if to_dict else response
 
 
 @app.get("/kachaka/{front_or_back}_camera_image.jpeg")
@@ -122,7 +122,7 @@ async def get(method: str) -> dict:
     Returns:
         The response from the method as a dictionary.
     """
-    return await run_method_or_404(method)
+    return {method: await run_method_or_404(method)}
 
 
 @app.post("/kachaka/{method:path}")

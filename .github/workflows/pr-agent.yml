@@ -1,0 +1,19 @@
+---
+name: LLM PR agent workflow
+
+on:
+  # For automatically comment on PRs created by PR agent when a PR is created
+  pull_request:
+    types: [opened]
+  # For run PR agent only when you post command in a comment
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  PR_agent:
+    name: PR agent
+    uses: sbgisen/.github/.github/workflows/pr_agent.yml@main
+    with:
+      common_extra_instructions: "Please answer in Japanese."  # Optional
+    secrets:
+      openai_key: ${{ secrets.OPENAI_KEY }}

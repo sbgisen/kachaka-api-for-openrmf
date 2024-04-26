@@ -47,12 +47,14 @@ class KachakaApiClientByZenoh:
         """
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
+        self.task_id = None
 
         # Initialize Zenoh session and publishers in constructor
         self.session = zenoh.open(self._get_zenoh_config(zenoh_router))
-        self.pose_pub = self.session.declare_publisher(f"kachaka/{self.robot_name}/pose")
-        self.map_name_pub = self.session.declare_publisher(f"kachaka/{self.robot_name}/map_name")
-        self.command_state_pub = self.session.declare_publisher(f"kachaka/{self.robot_name}/command_state")
+        self.pose_pub = self.session.declare_publisher(f"robots/{self.robot_name}/pose")
+        self.battery_pub = self.session.declare_publisher(f"robots/{self.robot_name}/battery")
+        self.map_name_pub = self.session.declare_publisher(f"robots/{self.robot_name}/map_name")
+        self.command_state_pub = self.session.declare_publisher(f"robots/{self.robot_name}/command_state")
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -83,20 +85,28 @@ class KachakaApiClientByZenoh:
 
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh."""
-        pose = await self.run_method("get_robot_pose")
-        self.pose_pub.put(pose)
+        pose_raw = await self.run_method("get_robot_pose")
+        pose = [pose_raw["x"], pose_raw["y"], pose_raw["theta"]]
+        self.pose_pub.put(json.dumps(pose).encode(), encoding=zenoh.Encoding.APP_JSON())
+
+    async def publish_battery(self) -> None:
+        """Publish the current robot battery to Zenoh."""
+        battery = 0.8
+        self.battery_pub.put(json.dumps(battery).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     async def publish_map_name(self) -> None:
         """Publish the current map name to Zenoh."""
         map_list = await self.run_method("get_map_list")
         search_id = await self.run_method("get_current_map_id")
         map_name = next((item["name"] for item in map_list if item["id"] == search_id), "L1")
-        self.map_name_pub.put(map_name)
+        self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     async def publish_result(self) -> None:
         """Publish the last command state to Zenoh."""
-        result = await self.run_method("get_command_state")
-        self.command_state_pub.put(result)
+        res = await self.run_method("get_command_state")
+        result = {"id": self.task_id, "is_completed": False}
+        result["is_completed"] = True if res[0] == 1 else False
+        self.command_state_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     def _to_dict(self,
                  response: Union[dict, list, RepeatedCompositeContainer, object]
@@ -133,6 +143,9 @@ class KachakaApiClientByZenoh:
             if not all(k in command for k in ('method', 'args')):
                 raise ValueError("Invalid command structure")
             method_name = command['method']
+            if method_name == "dock":
+                method_name = "return_home"
+            self.task_id = command.get('id', None)
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f"Invalid method: {method_name}")
             print(f"Received command: {command}")
@@ -146,7 +159,7 @@ class KachakaApiClientByZenoh:
             zenoh.Subscriber: The Zenoh subscriber object.
         """
         return self.session.declare_subscriber(
-            f"kachaka/{self.robot_name}/command", self._command_callback)
+            f"robots/{self.robot_name}/command", self._command_callback)
 
 
 def main() -> None:
@@ -167,6 +180,7 @@ def main() -> None:
         print(f"Subscribed to {sub}")
         while True:
             asyncio.run(node.publish_pose())
+            asyncio.run(node.publish_battery())
             asyncio.run(node.publish_map_name())
             asyncio.run(node.publish_result())
             time.sleep(1)

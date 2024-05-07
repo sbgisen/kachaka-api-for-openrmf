@@ -54,7 +54,8 @@ class KachakaApiClientByZenoh:
         self.pose_pub = self.session.declare_publisher(f"robots/{self.robot_name}/pose")
         self.battery_pub = self.session.declare_publisher(f"robots/{self.robot_name}/battery")
         self.map_name_pub = self.session.declare_publisher(f"robots/{self.robot_name}/map_name")
-        self.command_state_pub = self.session.declare_publisher(f"robots/{self.robot_name}/command_state")
+        self.command_is_completed_pub = self.session.declare_publisher(
+            f"robots/{self.robot_name}/command_is_completed")
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -102,11 +103,11 @@ class KachakaApiClientByZenoh:
         self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     async def publish_result(self) -> None:
-        """Publish the last command state to Zenoh."""
+        """Publish the last command is_completed to Zenoh."""
         res = await self.run_method("get_command_state")
         result = {"id": self.task_id, "is_completed": False}
         result["is_completed"] = True if res[0] == 1 else False
-        self.command_state_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
+        self.command_is_completed_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     def _to_dict(self,
                  response: Union[dict, list, RepeatedCompositeContainer, object]

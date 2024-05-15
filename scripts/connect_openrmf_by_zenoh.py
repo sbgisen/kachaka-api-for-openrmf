@@ -19,10 +19,12 @@ import asyncio
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any
 from typing import Union
 
 import kachaka_api
+import yaml
 import zenoh
 from google._upb._message import RepeatedCompositeContainer
 from google.protobuf.json_format import MessageToDict
@@ -45,6 +47,12 @@ class KachakaApiClientByZenoh:
             kachaka_access_point (str): The URL of the Kachaka API server.
             robot_name (str): The name of the robot, used in Zenoh topic names.
         """
+
+        file_path = Path(__file__).resolve().parent.parent
+        print(file_path)
+        with open(file_path / "config" / "config.yaml", 'r') as f:
+            config = yaml.safe_load(f)
+        self.method_mapping = config['method_mapping']
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
         self.task_id = None
@@ -92,6 +100,7 @@ class KachakaApiClientByZenoh:
 
     async def publish_battery(self) -> None:
         """Publish the current robot battery to Zenoh."""
+        # TODO Get the actual battery level from the robot
         battery = 0.8
         self.battery_pub.put(json.dumps(battery).encode(), encoding=zenoh.Encoding.APP_JSON())
 
@@ -144,8 +153,7 @@ class KachakaApiClientByZenoh:
             if not all(k in command for k in ('method', 'args')):
                 raise ValueError("Invalid command structure")
             method_name = command['method']
-            if method_name == "dock":
-                method_name = "return_home"
+            method_name = self.method_mapping.get(method_name, method_name)
             self.task_id = command.get('id', None)
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f"Invalid method: {method_name}")

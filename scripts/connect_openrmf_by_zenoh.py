@@ -95,7 +95,12 @@ class KachakaApiClientByZenoh:
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh."""
         pose_raw = await self.run_method("get_robot_pose")
-        pose = [pose_raw["x"], pose_raw["y"], pose_raw["theta"]]
+        try:
+            pose = [pose_raw["x"], pose_raw["y"], pose_raw["theta"]]
+        except KeyError:
+            # Handle unexpected format or missing data appropriately
+            print(f"{pose_raw} is unexpected response format")
+            return
         self.pose_pub.put(json.dumps(pose).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     async def publish_battery(self) -> None:
@@ -115,7 +120,11 @@ class KachakaApiClientByZenoh:
         """Publish the last command is_completed to Zenoh."""
         res = await self.run_method("get_command_state")
         result = {"id": self.task_id, "is_completed": False}
-        result["is_completed"] = True if res[0] == 1 else False
+        if isinstance(res, (list, tuple)) and len(res) > 0 and isinstance(res[0], int):
+            result["is_completed"] = True if res[0] == 1 else False
+        else:
+            # Handle unexpected format or missing data appropriately
+            print(f"{res} is unexpected response format")
         self.command_is_completed_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     def _to_dict(self,

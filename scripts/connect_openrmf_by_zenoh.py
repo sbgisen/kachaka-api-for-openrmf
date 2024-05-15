@@ -39,7 +39,7 @@ class KachakaApiClientByZenoh:
     topic to receive and execute commands.
     """
 
-    def __init__(self, zenoh_router: str, kachaka_access_point: str, robot_name: str) -> None:
+    def __init__(self, zenoh_router: str, kachaka_access_point: str, robot_name: str, config_file: str) -> None:
         """Constructor method.
         Args:
             zenoh_router (str): The address of the Zenoh router to connect to,
@@ -49,8 +49,7 @@ class KachakaApiClientByZenoh:
         """
 
         file_path = Path(__file__).resolve().parent.parent
-        print(file_path)
-        with open(file_path / "config" / "config.yaml", 'r') as f:
+        with open(file_path / "config" / config_file, 'r') as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         self.method_mapping = config.get('method_mapping', {})
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
@@ -189,10 +188,11 @@ def main() -> None:
     zenoh_router_ap = os.getenv('ZENOH_ROUTER_ACCESS_POINT')
     kachaka_access_point = os.getenv('KACHAKA_ACCESS_POINT')
     robot_name = os.getenv('ROBOT_NAME', 'kachaka')
+    config_file = os.getenv('CONFIG_FILE', 'config.yaml')
     if not zenoh_router_ap or not kachaka_access_point:
         raise ValueError("ZENOH_ROUTER_ACCESS_POINT and KACHAKA_ACCESS_POINT must be set as environment variables.")
 
-    node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name)
+    node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name, config_file)
     try:
         sub = node.subscribe_command()
         print(f"Subscribed to {sub}")

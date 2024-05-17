@@ -123,7 +123,7 @@ class KachakaApiClientByZenoh:
             result["is_completed"] = True if res[0] == 1 else False
         else:
             # Handle unexpected format or missing data appropriately
-            print(f"{res} is unexpected response format")
+            raise ValueError(f"{res} is unexpected response format")
         self.command_is_completed_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     def _to_dict(self,

@@ -50,7 +50,7 @@ class KachakaApiClientByZenoh:
 
         file_path = Path(__file__).resolve().parent.parent
         with open(file_path / "config" / config_file, 'r') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name

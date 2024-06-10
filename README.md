@@ -16,6 +16,22 @@ This repository contains the source code for the Kachaka API server and Zenoh no
 <!-- - Integration of Kachaka API with Open RMF using Zenoh -->
 <!-- - Web-based demo for remote control and monitoring of Kachaka robots -->
 
+## Usage of Scripts
+
+This repository includes two main scripts for different use cases:
+
+1. rest_kachaka_api.py:
+
+- Use this script when communicating with an Open-RMF server within the same network without NAT (Network Address Translation) traversal.
+- This script uses fleet_adapter_kachaka as the fleet adapter.
+- It leverages FastAPI to expose the required topics for the fleet adapter.
+
+1. connect_openrmf_by_zenoh.py:
+
+- Use this script when communicating with an Open-RMF server via Zenoh router, requiring NAT traversal.
+- It uses a common adapter that sends and receives Zenoh topics as the fleet adapter.
+  Choose the appropriate script based on your network setup and communication requirements.
+
 ## Cloning the repository
 
 ```bash
@@ -98,6 +114,18 @@ To send commands to the robot via Zenoh, publish a JSON-formatted message to the
   }
 }
 ```
+
+#### Configuration
+
+- The script reads the configuration from `config.yaml` to map the method names received from Open-RMF to the corresponding Kachaka API method names. For example, if config.yaml contains:
+
+  ```yaml
+  method_mapping:
+    dock: return_home
+  ```
+
+  The script will map the dock method from Open-RMF to the return_home method of the Kachaka API.
+  Please make sure to provide the necessary configuration, including the method_mapping, in the config.yaml file before running the connect_openrmf_by_zenoh.py script.
 
 ## License
 

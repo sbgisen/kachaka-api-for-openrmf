@@ -20,13 +20,13 @@ This repository contains the source code for the Kachaka API server and Zenoh no
 
 This repository includes two main scripts for different use cases:
 
-1. rest_kachaka_api.py:
+1. `rest_kachaka_api.py`
 
 - Use this script when communicating with an Open-RMF server within the same network without NAT (Network Address Translation) traversal.
 - This script uses fleet_adapter_kachaka as the fleet adapter.
 - It leverages FastAPI to expose the required topics for the fleet adapter.
 
-1. connect_openrmf_by_zenoh.py:
+1. `connect_openrmf_by_zenoh.py`:
 
 - Use this script when communicating with an Open-RMF server via Zenoh router, requiring NAT traversal.
 - It uses a common adapter that sends and receives Zenoh topics as the fleet adapter.

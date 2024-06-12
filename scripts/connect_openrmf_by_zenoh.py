@@ -52,6 +52,7 @@ class KachakaApiClientByZenoh:
         with open(file_path / "config" / config_file, 'r') as f:
             config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
+        self.map_name_mapping = config.get('map_name_mapping', {})
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
         self.task_id = None
@@ -116,6 +117,20 @@ class KachakaApiClientByZenoh:
         map_name = next((item["name"] for item in map_list if item["id"] == search_id), "L1")
         self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APP_JSON())
 
+    async def switch_map(self, args: dict) -> None:
+        """Switch the robot to the specified map.
+        Args:
+            args (dict): The arguments for the switch_map method.
+        """
+        map_name = self.map_name_mapping.get(args.get('map_name'), args.get('map_name'))
+        map_list = await self.run_method("get_map_list")
+        map_id = next((item["id"] for item in map_list if item["name"] == map_name), None)
+        if map_id is not None:
+            payload = {"map_id": map_id, "pose": args.get("pose", {"x": 0.0, "y": 0.0, "theta": 0.0})}
+            await self.run_method("switch_map", payload)
+        else:
+            print(f"Map {map_name} not found")
+
     async def publish_result(self) -> None:
         """Publish the last command is_completed to Zenoh."""
         res = await self.run_method("get_command_state")
@@ -167,7 +182,10 @@ class KachakaApiClientByZenoh:
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f"Invalid method: {method_name}")
             print(f"Received command: {command}")
-            asyncio.run(self.run_method(method_name, command['args']))
+            if method_name == "switch_map":
+                asyncio.run(self.switch_map(command['args']))
+            else:
+                asyncio.run(self.run_method(method_name, command['args']))
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             print(f"Invalid command: {str(e)}")
 

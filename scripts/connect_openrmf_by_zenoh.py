@@ -122,10 +122,12 @@ class KachakaApiClientByZenoh:
             args (dict): The arguments for the switch_map method.
         """
         map_list = await self.run_method("get_map_list")
-        map_id = next((item["id"] for item in map_list if item["name"] == args.get('map_name')))
+        map_id = next((item["id"] for item in map_list if item["name"] == args.get('map_name')), None)
         if map_id is not None:
             payload = {"map_id": map_id, "pose": args.get("pose", {"x": 0.0, "y": 0.0, "theta": 0.0})}
             await self.run_method("switch_map", payload)
+        else:
+            print(f"Map {args.get('map_name')} not found")
 
     async def publish_result(self) -> None:
         """Publish the last command is_completed to Zenoh."""
@@ -180,7 +182,8 @@ class KachakaApiClientByZenoh:
             print(f"Received command: {command}")
             if method_name == "switch_map":
                 asyncio.run(self.switch_map(command['args']))
-            asyncio.run(self.run_method(method_name, command['args']))
+            else:
+                asyncio.run(self.run_method(method_name, command['args']))
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             print(f"Invalid command: {str(e)}")
 

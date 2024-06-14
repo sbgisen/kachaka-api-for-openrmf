@@ -104,8 +104,9 @@ class KachakaApiClientByZenoh:
 
     async def publish_battery(self) -> None:
         """Publish the current robot battery to Zenoh."""
-        # TODO Get the actual battery level from the robot
-        battery = 0.8
+        res = await self.run_method("get_battery_info")
+        if isinstance(res, (list, tuple)) and len(res) > 0:
+            battery = res[0] / 100.0
         self.battery_pub.put(json.dumps(battery).encode(), encoding=zenoh.Encoding.APP_JSON())
 
     async def publish_map_name(self) -> None:
@@ -203,7 +204,7 @@ def main() -> None:
             asyncio.run(node.publish_result())
             time.sleep(1)
     except KeyboardInterrupt:
-        node.session.delete(f"kachaka/{robot_name}/**")
+        node.session.delete(f"robots/{robot_name}/**")
         node.session.close()
 
 

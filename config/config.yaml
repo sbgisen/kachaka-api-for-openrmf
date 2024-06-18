@@ -1,2 +1,3 @@
 method_mapping:
   dock: return_home
+  change_map: switch_map

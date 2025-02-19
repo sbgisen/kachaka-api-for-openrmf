@@ -53,6 +53,7 @@ class KachakaApiClientByZenoh:
             config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
         self.map_name_mapping = config.get('map_name_mapping', {})
+        self.zenoh_config = config.get('zenoh_config', None)
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
         self.task_id = None
@@ -73,8 +74,8 @@ class KachakaApiClientByZenoh:
         Returns:
             zenoh.Config: A Zenoh configuration object.
         """
-        conf = zenoh.Config()
-        conf.insert_json5(zenoh.config.CONNECT_KEY, json.dumps([f"tcp/{zenoh_router}"]))
+        conf = zenoh.Config.from_file(self.zenoh_config) if self.zenoh_config is not None else zenoh.Config()
+        conf.insert_json5('connect/endpoints', json.dumps([f'tcp/{zenoh_router}']))
         return conf
 
     async def run_method(self, method_name: str, args: dict = {}) -> Any:  # noqa: ANN401
@@ -101,21 +102,21 @@ class KachakaApiClientByZenoh:
             # Handle unexpected format or missing data appropriately
             print(f"{pose_raw} is unexpected response format")
             return
-        self.pose_pub.put(json.dumps(pose).encode(), encoding=zenoh.Encoding.APP_JSON())
+        self.pose_pub.put(json.dumps(pose).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
 
     async def publish_battery(self) -> None:
         """Publish the current robot battery to Zenoh."""
         res = await self.run_method("get_battery_info")
         if isinstance(res, (list, tuple)) and len(res) > 0:
             battery = res[0] / 100.0
-        self.battery_pub.put(json.dumps(battery).encode(), encoding=zenoh.Encoding.APP_JSON())
+        self.battery_pub.put(json.dumps(battery).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
 
     async def publish_map_name(self) -> None:
         """Publish the current map name to Zenoh."""
         map_list = await self.run_method("get_map_list")
         search_id = await self.run_method("get_current_map_id")
         map_name = next((item["name"] for item in map_list if item["id"] == search_id), "L1")
-        self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APP_JSON())
+        self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
 
     async def switch_map(self, args: dict) -> None:
         """Switch the robot to the specified map.
@@ -140,7 +141,7 @@ class KachakaApiClientByZenoh:
         else:
             # Handle unexpected format or missing data appropriately
             raise ValueError(f"{res} is unexpected response format")
-        self.command_is_completed_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APP_JSON())
+        self.command_is_completed_pub.put(json.dumps(result).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
 
     def _to_dict(self,
                  response: Union[dict, list, RepeatedCompositeContainer, object]

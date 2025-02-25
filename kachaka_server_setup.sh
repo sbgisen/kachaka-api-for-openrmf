@@ -51,4 +51,5 @@ EOF
 # Securely copy the server setup script and any additional scripts to the server.
 scp -P $SSH_PORT kachaka_startup.sh kachaka@$KACHAKA_IP:~/
 scp -P $SSH_PORT scripts/*.py kachaka@$KACHAKA_IP:~/sbgisen
+scp -r -P $SSH_PORT config/ kachaka@$KACHAKA_IP:~/sbgisen
 echo "Setup script and additional scripts have been copied to the server."

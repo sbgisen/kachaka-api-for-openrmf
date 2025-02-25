@@ -24,6 +24,8 @@ from typing import Any, Union
 
 from google._upb._message import RepeatedCompositeContainer
 from google.protobuf.json_format import MessageToDict
+from grpc import RpcError
+from grpc import StatusCode
 import kachaka_api
 import yaml
 import zenoh
@@ -49,7 +51,7 @@ class KachakaApiClientByZenoh:
             robot_name (str): The name of the robot, used in Zenoh topic names.
             config_file (str): The name of the configuration file to load.
         """
-        file_path = Path(__file__).resolve().parent.parent
+        file_path = Path(__file__).resolve().parent
         with open(file_path / 'config' / config_file, 'r') as f:
             config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
@@ -93,6 +95,7 @@ class KachakaApiClientByZenoh:
             Any: The result of the method call, converted to a dictionary
                 or list if it is a protobuf message.
         """
+        self.grpc_connection_check()
         args = args or {}
         method = getattr(self.kachaka_client, method_name)
         response = self._to_dict(method(**args))
@@ -183,7 +186,7 @@ class KachakaApiClientByZenoh:
             json.JSONDecodeError: If the command payload is not valid JSON.
         """
         try:
-            command = json.loads(sample.payload.decode('utf-8'))
+            command = json.loads(sample.payload.to_string())
             if not all(k in command for k in ('method', 'args')):
                 raise ValueError('Invalid command structure')
             method_name = command['method']
@@ -206,6 +209,25 @@ class KachakaApiClientByZenoh:
             zenoh.Subscriber: The Zenoh subscriber object.
         """
         return self.session.declare_subscriber(f'robots/{self.robot_name}/command', self._command_callback)
+
+    def grpc_connection_check(self) -> bool:
+        """Check if the gRPC connection is alive.
+
+        Returns:
+            Bool: True if the connection is alive, False otherwise.
+        """
+        max_retries = 20
+        sleep_time = 5
+        for i in range(max_retries):
+            try:
+                self.kachaka_client.get_robot_pose()
+                return True
+            except RpcError as e:
+                if e.code() == StatusCode.UNAVAILABLE:
+                    print(f'gRPC connection error: {e.details()}')
+                    time.sleep(sleep_time)
+                else:
+                    raise e
 
 
 def main() -> None:

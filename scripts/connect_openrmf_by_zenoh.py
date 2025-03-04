@@ -56,6 +56,7 @@ class KachakaApiClientByZenoh:
             config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
         self.map_name_mapping = config.get('map_name_mapping', {})
+        self.reverse_map_name_mapping = {v: k for k, v in self.map_name_mapping.items()}
         self.zenoh_config = config.get('zenoh_config', None)
         self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
         self.robot_name = robot_name
@@ -123,7 +124,8 @@ class KachakaApiClientByZenoh:
         """Publish the current map name to Zenoh."""
         map_list = await self.run_method('get_map_list')
         search_id = await self.run_method('get_current_map_id')
-        map_name = next((item['name'] for item in map_list if item['id'] == search_id), 'L1')
+        kachaka_map_name = next((item['name'] for item in map_list if item['id'] == search_id), 'L1')
+        map_name = self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
         self.map_name_pub.put(json.dumps(map_name).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
 
     async def switch_map(self, args: dict) -> None:

@@ -59,27 +59,32 @@ class KachakaApiClientByZenoh:
     def __init__(
         self,
         zenoh_router: str,
-        kachaka_access_point: str,
-        robot_name: str,
-        config_file: str,
+        kachaka_access_point: Optional[str] = None,
+        robot_name: str = 'kachaka',
+        config_file: str = 'config.yaml',
     ) -> None:
         """Construct method.
 
         Args:
             zenoh_router (str): The address of the Zenoh router to connect to,
                 in the format "ip:port".
-            kachaka_access_point (str): The URL of the Kachaka API server.
+            kachaka_access_point (str, optional): The URL of the Kachaka API server.
+                Can be None when running internally on Kachaka.
             robot_name (str): The name of the robot, used in Zenoh topic names.
+                Defaults to 'kachaka'.
             config_file (str): The name of the configuration file to load.
+                Defaults to 'config.yaml'.
         """
         file_path = Path(__file__).resolve().parent
-        with open(file_path / 'config' / config_file, 'r') as f:
+        config_path = file_path / '..' / 'config' if (file_path / '..' / 'config').exists() else file_path / 'config'
+        with open(config_path / config_file, 'r') as f:
             config = yaml.safe_load(f)
         self.method_mapping = config.get('method_mapping', {})
         self.map_name_mapping = config.get('map_name_mapping', {})
         self.reverse_map_name_mapping = {v: k for k, v in self.map_name_mapping.items()}
         self.zenoh_config = config.get('zenoh_config', None)
-        self.kachaka_client = kachaka_api.KachakaApiClient(kachaka_access_point)
+        self.kachaka_client = kachaka_api.KachakaApiClient(
+            kachaka_access_point) if kachaka_access_point else kachaka_api.KachakaApiClient()
         self.robot_name = robot_name
         self.task_id = None
         logging.basicConfig(
@@ -535,8 +540,8 @@ def main() -> None:
     kachaka_access_point = os.getenv('KACHAKA_ACCESS_POINT')
     robot_name = os.getenv('ROBOT_NAME', 'kachaka')
     config_file = os.getenv('CONFIG_FILE', 'config.yaml')
-    if not zenoh_router_ap or not kachaka_access_point:
-        raise ValueError('ZENOH_ROUTER_ACCESS_POINT and KACHAKA_ACCESS_POINT must be set as environment variables.')
+    if not zenoh_router_ap:
+        raise ValueError('ZENOH_ROUTER_ACCESS_POINT must be set as an environment variable.')
 
     try:
         node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name, config_file)

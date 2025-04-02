@@ -83,8 +83,8 @@ class KachakaApiClientByZenoh:
         self.map_name_mapping = config.get('map_name_mapping', {})
         self.reverse_map_name_mapping = {v: k for k, v in self.map_name_mapping.items()}
         self.zenoh_config = config.get('zenoh_config', None)
-        self.kachaka_client = kachaka_api.KachakaApiClient(
-            kachaka_access_point) if kachaka_access_point else kachaka_api.KachakaApiClient()
+        self.kachaka_client = (kachaka_api.KachakaApiClient(kachaka_access_point)
+                               if kachaka_access_point else kachaka_api.KachakaApiClient())
         self.robot_name = robot_name
         self.task_id = None
         logging.basicConfig(
@@ -102,6 +102,9 @@ class KachakaApiClientByZenoh:
         self.command_is_completed_pub = self.session.declare_publisher(
             f'robots/{self.robot_name}/command_is_completed')
         self.logger.info(f'Initialized KachakaApiClientByZenoh for robot {robot_name}')
+        self.last_pose = [0.0, 0.0, 0.0]
+        self.last_battery = 100.0
+        self.map_name = 'L1'
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -189,6 +192,7 @@ class KachakaApiClientByZenoh:
             pose_raw = await self.run_method('get_robot_pose')
             try:
                 pose = [pose_raw['x'], pose_raw['y'], pose_raw['theta']]
+                self.last_pose = pose
             except KeyError:
                 # Handle unexpected format or missing data appropriately
                 self.logger.error(f'{pose_raw} is unexpected response format')
@@ -219,6 +223,7 @@ class KachakaApiClientByZenoh:
             res = await self.run_method('get_battery_info')
             if isinstance(res, (list, tuple)) and len(res) > 0:
                 battery = res[0] / 100.0
+                self.last_battery = battery
             else:
                 self.logger.error(f'Unexpected battery info format: {res}')
                 print(f'Unexpected battery info format: {res}')
@@ -254,6 +259,7 @@ class KachakaApiClientByZenoh:
 
             kachaka_map_name = next((item['name'] for item in map_list if item['id'] == search_id), 'L1')
             map_name = self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
+            self.map_name = map_name
 
             self._publish_to_zenoh(self.map_name_pub, map_name)
         except ConnectionError as e:
@@ -309,10 +315,12 @@ class KachakaApiClientByZenoh:
 
             # switch map only if the map is different from the current map id
             # because switch_map method takes long time to complete
-            if map_id != current_map_id:
+            if map_id == current_map_id:
+                method_name = 'localize'
+                self.logger.info('Nothing to do')
+            else:
                 await self.run_method('switch_map', payload)
-
-            self.logger.info(f'Switched to map {map_name}')
+                self.logger.info(f'Switched to map {map_name}', {payload['pose']})
         except ConnectionError as e:
             self._log_error('Connection', method_name, e)
         except RpcError as e:
@@ -350,7 +358,7 @@ class KachakaApiClientByZenoh:
             result = {'id': self.task_id, 'is_completed': False}
 
             if isinstance(res, (list, tuple)) and len(res) > 0 and isinstance(res[0], int):
-                result['is_completed'] = True if res[0] == 1 else False
+                result['is_completed'] = True if res[0] != 2 else False
             else:
                 # Handle unexpected format or missing data appropriately
                 self.logger.error(f'Unexpected command state format: {res}')
@@ -359,6 +367,8 @@ class KachakaApiClientByZenoh:
 
             self.logger.info(f'Published command result: {result}')
             self._publish_to_zenoh(self.command_is_completed_pub, result)
+            # Reset task_id if the command is completed
+            self.task_id = None if result['is_completed'] else self.task_id
         except ConnectionError as e:
             self._log_error('Connection', method_name, e)
         except RpcError as e:
@@ -390,6 +400,8 @@ class KachakaApiClientByZenoh:
         Zenoh topic. It parses the command JSON, validates it, and runs the
         specified method with the provided arguments.
 
+        It also waits to confirm the command starts running properly before returning.
+
         Args:
             sample (Sample): The received Zenoh sample containing the command.
 
@@ -399,6 +411,24 @@ class KachakaApiClientByZenoh:
                 KachakaApiClient.
             json.JSONDecodeError: If the command payload is not valid JSON.
         """
+        # Check if the command is already running
+        method_name = 'command_callback'
+        try:
+            command_is_running = asyncio.run(self.run_method('is_command_running'))
+            if command_is_running:
+                self.logger.warning('Command is still running')
+                return
+            else:
+                self.logger.info('Ready to receive command')
+        except ConnectionError as e:
+            self._log_error('Connection', method_name, e)
+            return
+        except RpcError as e:
+            self._log_error('RPC', method_name, e)
+            return
+        except Exception as e:
+            self._log_error('Unexpected', method_name, e)
+
         try:
             command = json.loads(sample.payload.to_string())
             if not all(k in command for k in ('method', 'args')):
@@ -415,10 +445,24 @@ class KachakaApiClientByZenoh:
             print(f'Received command: {command}')
 
             try:
+                # Execute the command
                 if method_name == 'switch_map':
                     asyncio.run(self.switch_map(command['args']))
+                elif method_name == 'move_to_pose':
+                    # Handle move_to_pose command
+                    args = command['args']
+                    # Check if move_to_pose in this floor.
+                    map_name = args.pop('map_name', None)
+                    if map_name is not None and map_name != self.map_name:
+                        self.logger.warning(f'Map name {map_name} is not the same as current map {self.map_name}')
+                        return
+                    if 'cancel_all' not in args:
+                        args['cancel_all'] = False
+                    self.logger.info(f'Send move_to_pose {args=}')
+                    asyncio.run(self.run_method(method_name, args))
                 else:
                     asyncio.run(self.run_method(method_name, command['args']))
+
             except ConnectionError as e:
                 self._log_error('Connection', f'executing command {method_name}', e)
             except RpcError as e:
@@ -438,7 +482,7 @@ class KachakaApiClientByZenoh:
         """
         return self.session.declare_subscriber(f'robots/{self.robot_name}/command', self._command_callback)
 
-    def grpc_connection_check(self) -> bool:
+    def grpc_connection_check(self, max_retries: int = 20) -> bool:
         """Check if the gRPC connection to Kachaka API server is alive.
 
         Attempts to make a simple API call (get_robot_pose) to check if the
@@ -449,7 +493,7 @@ class KachakaApiClientByZenoh:
         other than connection problems.
 
         Args:
-            None
+            max_retries (int): The maximum number of retries to check the connection.
 
         Returns:
             bool: True if the connection is alive, False if it could not be
@@ -459,7 +503,6 @@ class KachakaApiClientByZenoh:
             RpcError: If an RPC error occurs that is not related to connection
                       availability (not StatusCode.UNAVAILABLE)
         """
-        max_retries = 20
         sleep_time = 5
         retry_count = 0
         last_error = None
@@ -474,6 +517,10 @@ class KachakaApiClientByZenoh:
             except RpcError as e:
                 retry_count += 1
                 last_error = e
+                self.logger.info('Send Dummy data')
+                self._publish_to_zenoh(self.pose_pub, self.last_pose)
+                self._publish_to_zenoh(self.battery_pub, self.last_battery)
+                self._publish_to_zenoh(self.map_name_pub, self.map_name)
                 if e.code() == StatusCode.UNAVAILABLE:
                     self.logger.error(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
                     print(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')

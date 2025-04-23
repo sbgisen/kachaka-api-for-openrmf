@@ -165,14 +165,20 @@ class KachakaApiClientByZenoh:
         self.logger.error(error_msg)
         print(error_msg)
 
-    def _publish_to_zenoh(self, publisher: zenoh.Publisher, data: Union[Dict, List, str, int, float, bool]) -> None:
+    def _publish_to_zenoh(self, publisher: zenoh.Publisher, data: Union[Dict, List, str, int, float, bool]) -> bool:
         """Publish data to a Zenoh topic with consistent encoding.
 
         Args:
             publisher: The Zenoh publisher to use
             data: The data to publish (will be JSON-encoded)
         """
-        publisher.put(json.dumps(data).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
+        try:
+            publisher.put(json.dumps(data).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
+        except Exception as e:
+            self.logger.error(f'Failed to publish data to Zenoh: {str(e)}')
+            print(f'Failed to publish data to Zenoh: {str(e)}')
+            return False
+        return True
 
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
@@ -366,9 +372,10 @@ class KachakaApiClientByZenoh:
                 return
 
             self.logger.info(f'Published command result: {result}')
-            self._publish_to_zenoh(self.command_is_completed_pub, result)
+            put_result = self._publish_to_zenoh(self.command_is_completed_pub, result)
             # Reset task_id if the command is completed
-            self.task_id = None if result['is_completed'] else self.task_id
+            if put_result and result['is_completed']:
+                self.task_id = None
         except ConnectionError as e:
             self._log_error('Connection', method_name, e)
         except RpcError as e:

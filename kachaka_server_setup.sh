@@ -36,7 +36,10 @@ cat <<EOF > kachaka_startup.sh
 #!/bin/bash
 # LINES MODIFIED BY SBGISEN, SEE /home/kachaka/kachaka_startup.sh.backup FOR THE ORIGINAL FILE.
 export KACHAKA_IP=$KACHAKA_IP
-export KACHAKA_ACCESS_POINT=\$KACHAKA_IP:26400
+# When running on the Kachaka robot internally, KACHAKA_ACCESS_POINT is optional
+if [ -n "$KACHAKA_IP" ]; then
+  export KACHAKA_ACCESS_POINT=\$KACHAKA_IP:26400
+fi
 export ZENOH_ROUTER_ACCESS_POINT=$ZENOH_ROUTER_ACCESS_POINT
 export ROBOT_NAME=$ROBOT_NAME
 export PATH=/home/kachaka/.local/bin:\$PATH
@@ -51,4 +54,5 @@ EOF
 # Securely copy the server setup script and any additional scripts to the server.
 scp -P $SSH_PORT kachaka_startup.sh kachaka@$KACHAKA_IP:~/
 scp -P $SSH_PORT scripts/*.py kachaka@$KACHAKA_IP:~/sbgisen
+scp -r -P $SSH_PORT config/ kachaka@$KACHAKA_IP:~/sbgisen
 echo "Setup script and additional scripts have been copied to the server."

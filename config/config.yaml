@@ -1,2 +1,8 @@
 method_mapping:
+  # <rmf method name>: <kachaka method name>
   dock: return_home
+  localize: switch_map
+map_name_mapping:
+  # <rmf map name>: <kachaka map name>
+  27F: L27
+  29F: L29

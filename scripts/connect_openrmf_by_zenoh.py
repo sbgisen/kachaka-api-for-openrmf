@@ -418,24 +418,6 @@ class KachakaApiClientByZenoh:
                 KachakaApiClient.
             json.JSONDecodeError: If the command payload is not valid JSON.
         """
-        # Check if the command is already running
-        method_name = 'command_callback'
-        try:
-            command_is_running = asyncio.run(self.run_method('is_command_running'))
-            if command_is_running:
-                self.logger.warning('Command is still running')
-                return
-            else:
-                self.logger.info('Ready to receive command')
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
-            return
-        except RpcError as e:
-            self._log_error('RPC', method_name, e)
-            return
-        except Exception as e:
-            self._log_error('Unexpected', method_name, e)
-
         try:
             command = json.loads(sample.payload.to_string())
             if not all(k in command for k in ('method', 'args')):
@@ -464,7 +446,9 @@ class KachakaApiClientByZenoh:
                         self.logger.warning(f'Map name {map_name} is not the same as current map {self.map_name}')
                         return
                     if 'cancel_all' not in args:
-                        args['cancel_all'] = False
+                        args['cancel_all'] = True
+                    if 'wait_for_completion' not in args:
+                        args['wait_for_completion'] = False
                     self.logger.info(f'Send move_to_pose {args=}')
                     asyncio.run(self.run_method(method_name, args))
                 else:

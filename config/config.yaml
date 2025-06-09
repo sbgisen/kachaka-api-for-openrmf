@@ -2,7 +2,22 @@ method_mapping:
   # <rmf method name>: <kachaka method name>
   dock: return_home
   localize: switch_map
+
 map_name_mapping:
   # <rmf map name>: <kachaka map name>
   27F: L27
   29F: L29
+
+# Timing settings
+timeouts:
+  command_query: 2.0        # Timeout for command queries in seconds
+  grpc_connection: 5        # Sleep time between gRPC connection retries in seconds
+
+intervals:
+  command_check: 4.0        # Interval for checking new commands in seconds
+  main_loop: 1              # Main loop sleep time in seconds
+
+# Connection settings
+connection:
+  max_retries: 20           # Maximum retries for gRPC connection check
+  max_consecutive_errors: 10  # Maximum consecutive errors before exit

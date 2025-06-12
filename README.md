@@ -9,7 +9,7 @@ This repository contains the source code for the Kachaka API server and Zenoh no
 - REST API server for interacting with the Kachaka API using HTTP requests
 - Zenoh node script for connecting Kachaka robots to a certain Zenoh managed network
   - Publishing robot pose, current map name, and command state as Zenoh topics
-  - Subscription to command topic for receiving and executing robot commands
+  - Queryable-based command processing with periodic command polling for reliable operation
 - Setup script for launching Kachaka REST API server and Zenoh node on the target device
 - Local development environment for testing components on a local machine
 
@@ -103,10 +103,11 @@ export ZENOH_ROUTER_ACCESS_POINT=<access_point_of_the_zenoh_router>  # e.g. 192.
 pipenv run python /path/to/kachaka-api-for-openrmf/scripts/connect_openrmf_by_zenoh.py
 ```
 
-To send commands to the robot via Zenoh, publish a JSON-formatted message to the `kachaka/<robot_name>/command` topic with the following structure:
+The Zenoh node uses a queryable-based architecture where the robot periodically queries for commands. Fleet adapters should provide commands via Zenoh queryables on the `robots/<robot_name>/command` topic with the following JSON structure:
 
 ```json
 {
+  "id": "<unique_command_id>",
   "method": "<method_name>",
   "args": {
     "arg1": "value1",
@@ -117,15 +118,86 @@ To send commands to the robot via Zenoh, publish a JSON-formatted message to the
 
 #### Configuration
 
-- The script reads the configuration from `config.yaml` to map the method names received from Open-RMF to the corresponding Kachaka API method names. For example, if config.yaml contains:
+The script reads configuration from `config/config.yaml`. See the config file for detailed parameter descriptions and examples:
 
-  ```yaml
-  method_mapping:
-    dock: return_home
-  ```
+**Method Mapping** - Maps Open-RMF method names to Kachaka API methods:
+```yaml
+method_mapping:
+  dock: return_home
+  localize: switch_map
+```
 
-  The script will map the dock method from Open-RMF to the return_home method of the Kachaka API.
-  Please make sure to provide the necessary configuration, including the method_mapping, in the config.yaml file before running the connect_openrmf_by_zenoh.py script.
+**Map Name Mapping** - Maps user-friendly map names to Kachaka internal names:
+```yaml
+map_name_mapping:
+  27F: L27
+  29F: L29
+```
+
+**Timing Settings** - Configurable timeouts and intervals:
+```yaml
+timeouts:
+  command_query: 2.0        # Command query timeout in seconds
+  grpc_connection: 5        # gRPC connection retry interval
+
+intervals:
+  command_check: 4.0        # Command polling interval in seconds
+  main_loop: 1              # Main loop sleep time
+
+connection:
+  max_retries: 20           # Maximum gRPC connection retries
+  max_consecutive_errors: 10 # Error threshold before exit
+```
+
+The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
+
+## Testing
+
+### Command Testing Script
+
+The repository includes a test script for validating Kachaka robot commands via Zenoh:
+
+```bash
+python test/test_kachaka_command.py <zenoh_router> <robot_name> <command> [args...]
+```
+
+#### Supported Commands
+
+**switch_map** - Switch to a different map:
+```bash
+# Switch to map 27F with default pose (0, 0, 0)
+python test/test_kachaka_command.py 127.0.0.1:7447 kachaka switch_map 27F
+
+# Switch to map L27 with custom pose
+python test/test_kachaka_command.py 127.0.0.1:7447 kachaka switch_map L27 1.0 2.0 0.5
+```
+
+**move_to_pose** - Move robot to specific coordinates:
+```bash
+# Move to coordinates (1.5, 2.0, 0.0) on current map
+python test/test_kachaka_command.py 127.0.0.1:7447 kachaka move_to_pose 1.5 2.0 0.0
+
+# Move to coordinates with specific map
+python test/test_kachaka_command.py 127.0.0.1:7447 kachaka move_to_pose 1.5 2.0 0.0 27F
+```
+
+**dock** - Return robot to charging dock:
+```bash
+python test/test_kachaka_command.py 127.0.0.1:7447 kachaka dock
+```
+
+#### How it works
+
+1. The test script creates a Zenoh queryable that simulates a fleet adapter
+2. When the robot queries for commands (every 4 seconds), the script responds with the specified command
+3. The robot executes the command and reports status via Zenoh topics
+4. Use Ctrl+C to stop the test script
+
+#### Prerequisites
+
+- Zenoh router must be running and accessible
+- `connect_openrmf_by_zenoh.py` must be running on the robot
+- Robot must be connected to the same Zenoh network
 
 ## License
 

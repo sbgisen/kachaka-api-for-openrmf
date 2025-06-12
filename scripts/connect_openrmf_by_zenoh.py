@@ -511,15 +511,15 @@ class KachakaApiClientByZenoh:
                 return
 
             current_map_id = self.kachaka_client.get_current_map_id()
-            pose = args.get('pose', {'x': 0.0, 'y': 0.0, 'theta': 0.0})
+            payload = {'map_id': map_id, 'pose': args.get('pose', {'x': 0.0, 'y': 0.0, 'theta': 0.0})}
 
             # switch map only if the map is different from the current map id
             # because switch_map method takes long time to complete
             if map_id == current_map_id:
                 self.logger.info('Nothing to do - already on target map')
             else:
-                self.kachaka_client.switch_map(map_id, pose)
-                self.logger.info(f'Switched to map {map_name}', pose)
+                self._execute_sync_method('switch_map', payload)
+                self.logger.info(f'Switched to map {map_name}', payload['pose'])
         except RpcError as e:
             self._log_error('RPC', method_name, e)
         except Exception as e:

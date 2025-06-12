@@ -1,23 +1,28 @@
+# Configuration for Kachaka API OpenRMF Bridge
+
+# Method name translation: RMF method -> Kachaka API method
 method_mapping:
-  # <rmf method name>: <kachaka method name>
-  dock: return_home
-  localize: switch_map
+  dock: return_home         # Dock command maps to return_home
+  localize: switch_map      # Localize command maps to switch_map
 
+# Map name translation: Display name -> Kachaka internal name
 map_name_mapping:
-  # <rmf map name>: <kachaka map name>
-  27F: L27
-  29F: L29
+  27F: L27                  # Floor 27 -> Kachaka map L27
+  29F: L29                  # Floor 29 -> Kachaka map L29
 
-# Timing settings
+# Timing configuration (all values in seconds)
 timeouts:
-  command_query: 2.0        # Timeout for command queries in seconds
-  grpc_connection: 5        # Sleep time between gRPC connection retries in seconds
+  command_query: 2.0        # Timeout for command queries
+  grpc_connection: 5        # Wait time between gRPC connection retries
 
 intervals:
-  command_check: 4.0        # Interval for checking new commands in seconds
-  main_loop: 1              # Main loop sleep time in seconds
+  command_check: 4.0        # How often to check for new commands
+  main_loop: 1              # How often to publish robot status
 
-# Connection settings
+# Connection reliability settings
 connection:
-  max_retries: 20           # Maximum retries for gRPC connection check
-  max_consecutive_errors: 10  # Maximum consecutive errors before exit
+  max_retries: 20           # Max gRPC connection retries
+  max_consecutive_errors: 10  # Exit after this many consecutive errors
+
+# Optional: Custom Zenoh config file path
+# zenoh_config: "/path/to/zenoh.json5"

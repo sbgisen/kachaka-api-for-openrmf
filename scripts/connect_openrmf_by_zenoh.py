@@ -31,7 +31,6 @@ from grpc import StatusCode
 import kachaka_api
 import yaml
 import zenoh
-from zenoh import Sample
 
 
 class KachakaApiClientByZenoh:
@@ -48,7 +47,6 @@ class KachakaApiClientByZenoh:
     battery_pub: zenoh.Publisher
     map_name_pub: zenoh.Publisher
     command_is_completed_pub: zenoh.Publisher
-    command_queryable: zenoh.Queryable
     status_queryable: zenoh.Queryable
     command_querier: zenoh.Querier
     kachaka_client: Any  # kachaka_api.KachakaApiClient
@@ -122,9 +120,7 @@ class KachakaApiClientByZenoh:
         self.command_is_completed_pub = self.session.declare_publisher(
             f'robots/{self.robot_name}/command_is_completed')
 
-        # Initialize queryables for request-reply pattern
-        self.command_queryable = self.session.declare_queryable(f'robots/{self.robot_name}/command',
-                                                                self._command_query_handler)
+        # Initialize queryable for request-reply pattern
         self.status_queryable = self.session.declare_queryable(f'robots/{self.robot_name}/status',
                                                                self._status_query_handler)
 
@@ -379,18 +375,6 @@ class KachakaApiClientByZenoh:
             return [self._to_dict(item) for item in response]
         return response
 
-    def _command_query_handler(self, query: zenoh.Query) -> None:
-        """Handle queries for last received command.
-
-        Args:
-            query (zenoh.Query): The received query
-        """
-        try:
-            reply_value = json.dumps(self.last_command if self.last_command else {}).encode()
-            query.reply(query.key_expr, reply_value, encoding=zenoh.Encoding.APPLICATION_JSON)
-        except Exception as e:
-            self.logger.error(f'Error handling command query: {str(e)}')
-
     def _status_query_handler(self, query: zenoh.Query) -> None:
         """Handle queries for robot status.
 
@@ -410,15 +394,6 @@ class KachakaApiClientByZenoh:
             self.logger.debug('Status query replied')
         except Exception as e:
             self.logger.error(f'Error handling status query: {str(e)}')
-
-    def _command_callback(self, sample: Sample) -> None:
-        """Handle received command samples (legacy subscriber support)."""
-        try:
-            command = json.loads(sample.payload.to_string())
-            self._execute_command(command)
-        except json.JSONDecodeError as e:
-            self.logger.error(f'Invalid JSON in command: {str(e)}')
-            print(f'Invalid JSON in command: {str(e)}')
 
     async def periodic_command_check(self) -> None:
         """Periodically check for new commands from the command server using Query.
@@ -719,8 +694,7 @@ def main() -> None:
         except KeyboardInterrupt:
             print('Interrupted by user, cleaning up...')
         finally:
-            # Clean up queryables and querier
-            node.command_queryable.undeclare()
+            # Clean up queryable and querier
             node.status_queryable.undeclare()
             node.command_querier.undeclare()
             # Clean up zenoh session

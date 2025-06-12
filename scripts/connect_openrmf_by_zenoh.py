@@ -312,65 +312,6 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
-    async def switch_map(self, args: Dict[str, Any]) -> None:
-        """Switch the robot to the specified map.
-
-        Handles the switch_map command from Zenoh, looking up the map by name
-        in the Kachaka API, and switching to it if it exists and is different
-        from the current map.
-
-        Applies any required name mappings defined in the configuration,
-        allowing for use of custom map names.
-
-        Args:
-            args (dict): The arguments for the switch_map method, including:
-                - map_name (str): The name of the map to switch to
-                - pose (dict, optional): The initial pose on the new map
-                  with x, y, theta keys. Defaults to origin with zero orientation.
-
-        Note:
-            Only switches maps if the requested map is different from the current one,
-            as the switching process can be time-consuming.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
-        """
-        method_name = 'switch_map'
-        try:
-            map_name = self.map_name_mapping.get(args.get('map_name'), args.get('map_name'))
-            map_list = await self.run_method('get_map_list')
-            map_id = next((item['id'] for item in map_list if item['name'] == map_name), None)
-
-            if map_id is None:
-                self.logger.error(f'Map {map_name} not found')
-                print(f'Map {map_name} not found')
-                return
-
-            current_map_id = await self.run_method('get_current_map_id')
-            payload = {
-                'map_id': map_id,
-                'pose': args.get('pose', {
-                    'x': 0.0,
-                    'y': 0.0,
-                    'theta': 0.0
-                }),
-            }
-
-            # switch map only if the map is different from the current map id
-            # because switch_map method takes long time to complete
-            if map_id == current_map_id:
-                method_name = 'localize'
-                self.logger.info('Nothing to do')
-            else:
-                await self.run_method('switch_map', payload)
-                self.logger.info(f'Switched to map {map_name}', {payload['pose']})
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
-        except RpcError as e:
-            self._log_error('RPC', method_name, e)
-        except Exception as e:
-            self._log_error('Unexpected', method_name, e)
-
     async def publish_result(self) -> None:
         """Publish the last command completion status to Zenoh.
 
@@ -547,9 +488,8 @@ class KachakaApiClientByZenoh:
 
             # Execute the command
             if method_name == 'switch_map':
-                # TODO: Handle switch_map properly in async context
-                self.logger.warning('switch_map not yet supported in new command processing')
-                pass
+                args = command['args']
+                self._execute_switch_map_sync(args)
             elif method_name == 'move_to_pose':
                 args = command['args']
                 map_name = args.pop('map_name', None)
@@ -570,6 +510,45 @@ class KachakaApiClientByZenoh:
             print(f'Invalid command: {str(e)}')
         except (ConnectionError, RpcError, Exception) as e:
             self._log_error('Unexpected', f'executing command {method_name}', e)
+
+    def _execute_switch_map_sync(self, args: Dict[str, Any]) -> None:
+        """Execute switch_map command synchronously.
+
+        Args:
+            args (dict): The arguments for the switch_map method, including:
+                - map_name (str): The name of the map to switch to
+                - pose (dict, optional): The initial pose on the new map
+        """
+        method_name = 'switch_map'
+        try:
+            if not self.grpc_connection_check():
+                error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
+                self.logger.error(error_msg)
+                raise ConnectionError(error_msg)
+
+            map_name = self.map_name_mapping.get(args.get('map_name'), args.get('map_name'))
+            map_list = self._to_dict(self.kachaka_client.get_map_list())
+            map_id = next((item['id'] for item in map_list if item['name'] == map_name), None)
+
+            if map_id is None:
+                self.logger.error(f'Map {map_name} not found')
+                print(f'Map {map_name} not found')
+                return
+
+            current_map_id = self.kachaka_client.get_current_map_id()
+            pose = args.get('pose', {'x': 0.0, 'y': 0.0, 'theta': 0.0})
+
+            # switch map only if the map is different from the current map id
+            # because switch_map method takes long time to complete
+            if map_id == current_map_id:
+                self.logger.info('Nothing to do - already on target map')
+            else:
+                self.kachaka_client.switch_map(map_id, pose)
+                self.logger.info(f'Switched to map {map_name}', pose)
+        except RpcError as e:
+            self._log_error('RPC', method_name, e)
+        except Exception as e:
+            self._log_error('Unexpected', method_name, e)
 
     def _execute_sync_method(self, method_name: str, args: Dict[str, Any]) -> None:
         """Execute a method synchronously without asyncio.run().

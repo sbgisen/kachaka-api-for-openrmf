@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -30,7 +31,6 @@ from grpc import StatusCode
 import kachaka_api
 import yaml
 import zenoh
-from zenoh import Sample
 
 
 class KachakaApiClientByZenoh:
@@ -47,6 +47,8 @@ class KachakaApiClientByZenoh:
     battery_pub: zenoh.Publisher
     map_name_pub: zenoh.Publisher
     command_is_completed_pub: zenoh.Publisher
+    status_queryable: zenoh.Queryable
+    command_querier: zenoh.Querier
     kachaka_client: Any  # kachaka_api.KachakaApiClient
     method_mapping: Dict[str, str]
     map_name_mapping: Dict[str, str]
@@ -54,6 +56,10 @@ class KachakaApiClientByZenoh:
     zenoh_config: Optional[str]
     robot_name: str
     task_id: Optional[str]
+    last_command: Optional[Dict[str, Any]]
+    last_command_result: Optional[Dict[str, Any]]
+    last_command_id: Optional[str]
+    command_check_interval: float
     logger: logging.Logger
 
     def __init__(
@@ -83,6 +89,18 @@ class KachakaApiClientByZenoh:
         self.map_name_mapping = config.get('map_name_mapping', {})
         self.reverse_map_name_mapping = {v: k for k, v in self.map_name_mapping.items()}
         self.zenoh_config = config.get('zenoh_config', None)
+
+        # Load timing and connection settings
+        timeouts = config.get('timeouts', {})
+        intervals = config.get('intervals', {})
+        connection = config.get('connection', {})
+
+        self.command_query_timeout = timeouts.get('command_query', 2.0)
+        self.grpc_connection_sleep = timeouts.get('grpc_connection', 5)
+        self.command_check_interval = intervals.get('command_check', 4.0)
+        self.main_loop_sleep = intervals.get('main_loop', 1)
+        self.max_retries = connection.get('max_retries', 20)
+        self.max_consecutive_errors = connection.get('max_consecutive_errors', 10)
         self.kachaka_client = (kachaka_api.KachakaApiClient(kachaka_access_point)
                                if kachaka_access_point else kachaka_api.KachakaApiClient())
         self.robot_name = robot_name
@@ -101,10 +119,25 @@ class KachakaApiClientByZenoh:
         self.map_name_pub = self.session.declare_publisher(f'robots/{self.robot_name}/map_name')
         self.command_is_completed_pub = self.session.declare_publisher(
             f'robots/{self.robot_name}/command_is_completed')
+
+        # Initialize queryable for request-reply pattern
+        self.status_queryable = self.session.declare_queryable(f'robots/{self.robot_name}/status',
+                                                               self._status_query_handler)
+
+        # Initialize querier for fetching commands from fleet adapter
+        self.command_querier = self.session.declare_querier(
+            f'robots/{self.robot_name}/command',
+            target=zenoh.QueryTarget.ALL,
+            timeout=self.command_query_timeout,
+        )
+
         self.logger.info(f'Initialized KachakaApiClientByZenoh for robot {robot_name}')
         self.last_pose = [0.0, 0.0, 0.0]
         self.last_battery = 100.0
         self.map_name = 'L1'
+        self.last_command = None
+        self.last_command_result = None
+        self.last_command_id = None
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -275,65 +308,6 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
-    async def switch_map(self, args: Dict[str, Any]) -> None:
-        """Switch the robot to the specified map.
-
-        Handles the switch_map command from Zenoh, looking up the map by name
-        in the Kachaka API, and switching to it if it exists and is different
-        from the current map.
-
-        Applies any required name mappings defined in the configuration,
-        allowing for use of custom map names.
-
-        Args:
-            args (dict): The arguments for the switch_map method, including:
-                - map_name (str): The name of the map to switch to
-                - pose (dict, optional): The initial pose on the new map
-                  with x, y, theta keys. Defaults to origin with zero orientation.
-
-        Note:
-            Only switches maps if the requested map is different from the current one,
-            as the switching process can be time-consuming.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
-        """
-        method_name = 'switch_map'
-        try:
-            map_name = self.map_name_mapping.get(args.get('map_name'), args.get('map_name'))
-            map_list = await self.run_method('get_map_list')
-            map_id = next((item['id'] for item in map_list if item['name'] == map_name), None)
-
-            if map_id is None:
-                self.logger.error(f'Map {map_name} not found')
-                print(f'Map {map_name} not found')
-                return
-
-            current_map_id = await self.run_method('get_current_map_id')
-            payload = {
-                'map_id': map_id,
-                'pose': args.get('pose', {
-                    'x': 0.0,
-                    'y': 0.0,
-                    'theta': 0.0
-                }),
-            }
-
-            # switch map only if the map is different from the current map id
-            # because switch_map method takes long time to complete
-            if map_id == current_map_id:
-                method_name = 'localize'
-                self.logger.info('Nothing to do')
-            else:
-                await self.run_method('switch_map', payload)
-                self.logger.info(f'Switched to map {map_name}', {payload['pose']})
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
-        except RpcError as e:
-            self._log_error('RPC', method_name, e)
-        except Exception as e:
-            self._log_error('Unexpected', method_name, e)
-
     async def publish_result(self) -> None:
         """Publish the last command completion status to Zenoh.
 
@@ -371,7 +345,8 @@ class KachakaApiClientByZenoh:
                 print(f'Unexpected command state format: {res}')
                 return
 
-            self.logger.info(f'Published command result: {result}')
+            self.logger.debug(f'Command {self.task_id} completed: {result["is_completed"]}')
+            self.last_command_result = result
             put_result = self._publish_to_zenoh(self.command_is_completed_pub, result)
             # Reset task_id if the command is completed
             if put_result and result['is_completed']:
@@ -400,26 +375,78 @@ class KachakaApiClientByZenoh:
             return [self._to_dict(item) for item in response]
         return response
 
-    def _command_callback(self, sample: Sample) -> None:
-        """Handle received command samples.
-
-        This method is called whenever a command is received on the subscribed
-        Zenoh topic. It parses the command JSON, validates it, and runs the
-        specified method with the provided arguments.
-
-        It also waits to confirm the command starts running properly before returning.
+    def _status_query_handler(self, query: zenoh.Query) -> None:
+        """Handle queries for robot status.
 
         Args:
-            sample (Sample): The received Zenoh sample containing the command.
-
-        Raises:
-            ValueError: If the command structure is invalid.
-            AttributeError: If the specified method does not exist on the
-                KachakaApiClient.
-            json.JSONDecodeError: If the command payload is not valid JSON.
+            query (zenoh.Query): The received query
         """
+
         try:
-            command = json.loads(sample.payload.to_string())
+            status_data = {
+                'robot_name': self.robot_name,
+                'pose': self.last_pose,
+                'map_name': self.map_name,
+                'battery': self.last_battery,
+                'command_is_completed': self.last_command_result if self.last_command_result else {},
+            }
+            reply_value = json.dumps(status_data).encode()
+            query.reply(query.key_expr, reply_value, encoding=zenoh.Encoding.APPLICATION_JSON)
+            self.logger.debug('Status query replied')
+        except Exception as e:
+            self.logger.error(f'Error handling status query: {str(e)}')
+
+    async def periodic_command_check(self) -> None:
+        """Periodically check for new commands from the command server using Query.
+
+        This replaces the push-based subscriber model with a pull-based query model
+        to improve reliability in case of temporary network disconnections.
+        """
+        self.logger.info('Starting periodic command check...')
+        while True:
+            try:
+                # Query the command server for the latest command using Querier
+                replies = self.command_querier.get()
+
+                for reply in replies:
+                    if reply.ok:
+                        command = json.loads(reply.ok.payload.to_string())
+                        command_id = command.get('id')
+
+                        # Check if this is a new command
+                        if command_id and command_id != self.last_command_id:
+                            self.logger.info(f'Received new command: {command}')
+                            print(f'New command: {command["method"]} (ID: {command_id})')
+
+                            # Update last command ID to prevent duplicate processing
+                            self.last_command_id = command_id
+
+                            # Process the command using unified logic
+                            try:
+                                self._execute_command(command)
+                            except Exception as e:
+                                self.logger.error(f'Error processing command: {str(e)}')
+                                print(f'Error processing command: {str(e)}')
+                        else:
+                            self.logger.debug(f'Skipping duplicate command ID: {command_id}')
+                    else:
+                        error_payload = (reply.err.payload.to_string()
+                                         if reply.err and reply.err.payload else 'Unknown error')
+                        if error_payload == 'Timeout':
+                            self.logger.debug('Query timeout (normal if no new commands)')
+                        else:
+                            self.logger.warning(f'Reply error: {error_payload}')
+
+            except Exception as e:
+                self.logger.debug(f'Command check error or no new commands: {e}')
+
+            # Wait before next check
+            await asyncio.sleep(self.command_check_interval)
+
+    def _execute_command(self, command: Dict[str, Any]) -> None:
+        """Unified command execution logic."""
+        method_name = 'execute_command'
+        try:
             if not all(k in command for k in ('method', 'args')):
                 raise ValueError('Invalid command structure')
 
@@ -430,50 +457,100 @@ class KachakaApiClientByZenoh:
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f'Invalid method: {method_name}')
 
-            self.logger.info(f'Received command: {command}')
-            print(f'Received command: {command}')
 
-            try:
-                # Execute the command
-                if method_name == 'switch_map':
-                    asyncio.run(self.switch_map(command['args']))
-                elif method_name == 'move_to_pose':
-                    # Handle move_to_pose command
-                    args = command['args']
-                    # Check if move_to_pose in this floor.
-                    map_name = args.pop('map_name', None)
-                    if map_name is not None and map_name != self.map_name:
-                        self.logger.warning(f'Map name {map_name} is not the same as current map {self.map_name}')
-                        return
-                    if 'cancel_all' not in args:
-                        args['cancel_all'] = True
-                    if 'wait_for_completion' not in args:
-                        args['wait_for_completion'] = False
-                    self.logger.info(f'Send move_to_pose {args=}')
-                    asyncio.run(self.run_method(method_name, args))
-                else:
-                    asyncio.run(self.run_method(method_name, command['args']))
+            self.logger.info(f'Executing command: {method_name} (ID: {self.task_id})')
+            print(f'Executing: {method_name}')
+            self.last_command = command
+            self.last_command_result = None
 
-            except ConnectionError as e:
-                self._log_error('Connection', f'executing command {method_name}', e)
-            except RpcError as e:
-                self._log_error('RPC', f'executing command {method_name}', e)
-            except Exception as e:
-                self._log_error('Unexpected', f'executing command {method_name}', e)
-
+            # Execute the command
+            if method_name == 'switch_map':
+                args = command['args']
+                self._execute_switch_map_sync(args)
+            elif method_name == 'move_to_pose':
+                args = command['args']
+                map_name = args.pop('map_name', None)
+                if map_name is not None and map_name != self.map_name:
+                    self.logger.warning(f'Map name {map_name} does not match current map {self.map_name}')
+                    return
+                if 'cancel_all' not in args:
+                    args['cancel_all'] = True
+                if 'wait_for_completion' not in args:
+                    args['wait_for_completion'] = False
+                self.logger.debug(f'move_to_pose args: {args}')
+                self._execute_sync_method(method_name, args)
+            else:
+                self._execute_sync_method(method_name, command['args'])
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             self.logger.error(f'Invalid command: {str(e)}')
             print(f'Invalid command: {str(e)}')
+        except (ConnectionError, RpcError, Exception) as e:
+            self._log_error('Unexpected', f'executing command {method_name}', e)
 
-    def subscribe_command(self) -> zenoh.Subscriber:
-        """Subscribe to the command topic.
+    def _execute_switch_map_sync(self, args: Dict[str, Any]) -> None:
+        """Execute switch_map command synchronously.
 
-        Returns:
-            zenoh.Subscriber: The Zenoh subscriber object.
+        Args:
+            args (dict): The arguments for the switch_map method, including:
+                - map_name (str): The name of the map to switch to
+                - pose (dict, optional): The initial pose on the new map
         """
-        return self.session.declare_subscriber(f'robots/{self.robot_name}/command', self._command_callback)
+        method_name = 'switch_map'
+        try:
+            if not self.grpc_connection_check():
+                error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
+                self.logger.error(error_msg)
+                raise ConnectionError(error_msg)
 
-    def grpc_connection_check(self, max_retries: int = 20) -> bool:
+            map_name = self.map_name_mapping.get(args.get('map_name'), args.get('map_name'))
+            map_list = self._to_dict(self.kachaka_client.get_map_list())
+            map_id = next((item['id'] for item in map_list if item['name'] == map_name), None)
+
+            if map_id is None:
+                self.logger.error(f'Map {map_name} not found')
+                print(f'Map {map_name} not found')
+                return
+
+            current_map_id = self.kachaka_client.get_current_map_id()
+            payload = {'map_id': map_id, 'pose': args.get('pose', {'x': 0.0, 'y': 0.0, 'theta': 0.0})}
+
+            # switch map only if the map is different from the current map id
+            # because switch_map method takes long time to complete
+            if map_id == current_map_id:
+                self.logger.info('Nothing to do - already on target map')
+            else:
+                self._execute_sync_method('switch_map', payload)
+                self.logger.info(f'Switched to map {map_name}', payload['pose'])
+        except RpcError as e:
+            self._log_error('RPC', method_name, e)
+        except Exception as e:
+            self._log_error('Unexpected', method_name, e)
+
+    def _execute_sync_method(self, method_name: str, args: Dict[str, Any]) -> None:
+        """Execute a method synchronously without asyncio.run().
+
+        Args:
+            method_name (str): The name of the method to execute
+            args (Dict[str, Any]): The arguments for the method
+        """
+        try:
+            if not self.grpc_connection_check():
+                error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
+                self.logger.error(error_msg)
+                raise ConnectionError(error_msg)
+
+            method = getattr(self.kachaka_client, method_name)
+            response = self._to_dict(method(**args))
+            self.logger.info(f'Command {method_name} executed successfully')
+            return response
+        except RpcError as e:
+            self.logger.error(f'RPC error in {method_name}: {e.details()}')
+            raise
+        except Exception as e:
+            self.logger.error(f'Unexpected error in {method_name}: {str(e)}')
+            raise
+
+    def grpc_connection_check(self, max_retries: Optional[int] = None) -> bool:
         """Check if the gRPC connection to Kachaka API server is alive.
 
         Attempts to make a simple API call (get_robot_pose) to check if the
@@ -484,7 +561,8 @@ class KachakaApiClientByZenoh:
         other than connection problems.
 
         Args:
-            max_retries (int): The maximum number of retries to check the connection.
+            max_retries (int, optional): The maximum number of retries to check the connection.
+                                       Uses config value if not specified.
 
         Returns:
             bool: True if the connection is alive, False if it could not be
@@ -494,7 +572,9 @@ class KachakaApiClientByZenoh:
             RpcError: If an RPC error occurs that is not related to connection
                       availability (not StatusCode.UNAVAILABLE)
         """
-        sleep_time = 5
+        if max_retries is None:
+            max_retries = self.max_retries
+        sleep_time = self.grpc_connection_sleep
         retry_count = 0
         last_error = None
 
@@ -585,13 +665,20 @@ def main() -> None:
         node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name, config_file)
 
         try:
-            sub = node.subscribe_command()
-            print(f'Subscribed to {sub}')
-            node.logger.info(f'Subscribed to {sub}')
+            # Start the node with periodic command checking via Queryable pattern
+            print('Starting KachakaApiClientByZenoh with periodic command checking...')
+            node.logger.info('Starting KachakaApiClientByZenoh with periodic command checking...')
 
             consecutive_errors = 0
-            max_consecutive_errors = 10
-            sleep_time = 1
+            max_consecutive_errors = node.max_consecutive_errors
+            sleep_time = node.main_loop_sleep
+
+            # Create a separate thread for command checking
+            def run_command_check() -> None:
+                asyncio.run(node.periodic_command_check())
+
+            command_thread = threading.Thread(target=run_command_check, daemon=True)
+            command_thread.start()
 
             while True:
                 try:
@@ -608,6 +695,9 @@ def main() -> None:
         except KeyboardInterrupt:
             print('Interrupted by user, cleaning up...')
         finally:
+            # Clean up queryable and querier
+            node.status_queryable.undeclare()
+            node.command_querier.undeclare()
             # Clean up zenoh session
             node.session.delete(f'robots/{robot_name}/**')
             node.session.close()

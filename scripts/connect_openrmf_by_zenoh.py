@@ -381,6 +381,7 @@ class KachakaApiClientByZenoh:
         Args:
             query (zenoh.Query): The received query
         """
+
         try:
             status_data = {
                 'robot_name': self.robot_name,
@@ -456,6 +457,7 @@ class KachakaApiClientByZenoh:
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f'Invalid method: {method_name}')
 
+
             self.logger.info(f'Executing command: {method_name} (ID: {self.task_id})')
             print(f'Executing: {method_name}')
             self.last_command = command
@@ -479,7 +481,6 @@ class KachakaApiClientByZenoh:
                 self._execute_sync_method(method_name, args)
             else:
                 self._execute_sync_method(method_name, command['args'])
-
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             self.logger.error(f'Invalid command: {str(e)}')
             print(f'Invalid command: {str(e)}')

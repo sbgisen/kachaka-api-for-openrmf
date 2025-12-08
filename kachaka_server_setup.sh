@@ -27,7 +27,7 @@ RUN_LINE="jupyter-lab --port=26501 --ip='0.0.0.0' & uvicorn sbgisen.rest_kachaka
 read -p "Do you want to set up the Zenoh client? (y/n) " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-  read -p "Enter the Zenoh router access point: " ZENOH_ROUTER_ACCESS_POINT
+  read -p "Enter the Zenoh router access point (IP:Port, e.g., 192.168.1.100:7447): " ZENOH_ROUTER_ACCESS_POINT
   read -p "Enter the robot name: " ROBOT_NAME
   RUN_LINE="$RUN_LINE & python3 sbgisen/connect_openrmf_by_zenoh.py"
 fi

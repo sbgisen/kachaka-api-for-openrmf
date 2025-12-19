@@ -49,14 +49,14 @@ def create_switch_map_command(robot_name: str,
         'args': {
             'map_name': map_name,
             'pose': pose
-        }
+        },
     }
 
 
 def create_move_to_pose_command(robot_name: str,
                                 x: float,
                                 y: float,
-                                theta: float,
+                                yaw: float,
                                 map_name: Optional[str] = None) -> Dict[str, Any]:
     """Create a move_to_pose command.
 
@@ -64,13 +64,13 @@ def create_move_to_pose_command(robot_name: str,
         robot_name: Name of the robot
         x: Target x coordinate
         y: Target y coordinate
-        theta: Target orientation in radians
+        yaw: Target orientation in radians
         map_name: Optional map name (if different from current)
 
     Returns:
         Command dictionary
     """
-    args = {'x': x, 'y': y, 'theta': theta}
+    args = {'x': x, 'y': y, 'yaw': yaw}
 
     if map_name:
         args['map_name'] = map_name
@@ -103,20 +103,50 @@ def publish_command_via_queryable(zenoh_router: str, robot_name: str, command: D
     conf.insert_json5('connect/endpoints', json.dumps([f'tcp/{zenoh_router}']))
 
     session = zenoh.open(conf)
+    command_sent = False
+    command_id = command.get('id')
 
     try:
         # Declare queryable for fleet adapter simulation
         def command_handler(query: zenoh.Query) -> None:
+            nonlocal command_sent
             print(f'🔍 Received query from robot: {query.key_expr}')
             # Reply with the command
             reply_payload = json.dumps(command).encode()
             query.reply(query.key_expr, reply_payload, encoding=zenoh.Encoding.APPLICATION_JSON)
             print(f'📤 Sent command: {command}')
+            command_sent = True
+
+        # Subscribe to command completion results
+        def result_handler(sample: zenoh.Sample) -> None:
+            try:
+                result = json.loads(sample.payload.to_string())
+                result_id = result.get('id', 'unknown')
+                is_completed = result.get('is_completed', False)
+                success = result.get('success')
+                error_code = result.get('error_code')
+
+                if result_id == command_id:
+                    if is_completed:
+                        if success:
+                            print(f'✅ Command completed successfully! (id: {result_id})')
+                        else:
+                            print(f'❌ Command failed! (id: {result_id}, error_code: {error_code})')
+                    else:
+                        print(f'⏳ Command in progress... (id: {result_id})')
+                else:
+                    print(f'📨 Result for other command: {result_id}')
+            except json.JSONDecodeError:
+                print(f'⚠️ Invalid JSON in result: {sample.payload.to_string()}')
 
         queryable_key = f'robots/{robot_name}/command'
         queryable = session.declare_queryable(queryable_key, command_handler)
 
+        result_key = f'robots/{robot_name}/command_is_completed'
+        subscriber = session.declare_subscriber(result_key, result_handler)
+
         print(f'✅ Queryable declared on key: {queryable_key}')
+        print(f'✅ Subscribed to results on key: {result_key}')
         print(f'📋 Ready to send command: {json.dumps(command, indent=2)}')
         print('⏳ Waiting for robot to query for commands...')
         print('   (Robot queries every 4 seconds)')
@@ -130,6 +160,7 @@ def publish_command_via_queryable(zenoh_router: str, robot_name: str, command: D
         print('\n🛑 Stopping...')
     finally:
         queryable.undeclare()
+        subscriber.undeclare()
         session.close()
         print('✅ Cleaned up and closed Zenoh session')
 
@@ -143,7 +174,7 @@ def print_usage() -> None:
     print('    Example: python test_kachaka_command.py 127.0.0.1:7447 kachaka switch_map 27F')
     print('    Example: python test_kachaka_command.py 127.0.0.1:7447 kachaka switch_map L27 1.0 2.0 0.5')
     print()
-    print('  move_to_pose <x> <y> <theta> [map_name]')
+    print('  move_to_pose <x> <y> <yaw> [map_name]')
     print('    Example: python test_kachaka_command.py 127.0.0.1:7447 kachaka move_to_pose 1.5 2.0 0.0')
     print('    Example: python test_kachaka_command.py 127.0.0.1:7447 kachaka move_to_pose 1.5 2.0 0.0 27F')
     print()
@@ -181,16 +212,16 @@ def main() -> None:
 
         elif command_type == 'move_to_pose':
             if len(sys.argv) < 7:
-                print('❌ move_to_pose requires x, y, theta')
+                print('❌ move_to_pose requires x, y, yaw')
                 print_usage()
                 sys.exit(1)
 
             x = float(sys.argv[4])
             y = float(sys.argv[5])
-            theta = float(sys.argv[6])
+            yaw = float(sys.argv[6])
             map_name = sys.argv[7] if len(sys.argv) > 7 else None
 
-            command = create_move_to_pose_command(robot_name, x, y, theta, map_name)
+            command = create_move_to_pose_command(robot_name, x, y, yaw, map_name)
 
         elif command_type == 'dock':
             command = create_dock_command(robot_name)

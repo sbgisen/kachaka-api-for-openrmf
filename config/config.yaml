@@ -14,6 +14,7 @@ map_name_mapping:
 timeouts:
   command_query: 2.0        # Timeout for command queries
   grpc_connection: 5        # Wait time between gRPC connection retries
+  running_state_wait: 5.0   # Max wait time for RUNNING state after command sent
 
 intervals:
   command_check: 4.0        # How often to check for new commands

@@ -30,6 +30,7 @@ from google.protobuf.json_format import MessageToDict
 from grpc import RpcError
 from grpc import StatusCode
 import kachaka_api
+from kachaka_api.generated import kachaka_api_pb2 as pb2
 import yaml
 import zenoh
 
@@ -60,6 +61,9 @@ class KachakaApiClientByZenoh:
     last_command: Optional[Dict[str, Any]]
     last_command_result: Optional[Dict[str, Any]]
     last_command_id: Optional[str]
+    current_command_id: Optional[str]
+    is_async_command: bool
+    saw_running: bool
     command_check_interval: float
     logger: logging.Logger
 
@@ -102,6 +106,7 @@ class KachakaApiClientByZenoh:
 
         self.command_query_timeout = timeouts.get('command_query', 2.0)
         self.grpc_connection_sleep = timeouts.get('grpc_connection', 5)
+        self.running_state_wait = timeouts.get('running_state_wait', 5.0)
         self.command_check_interval = intervals.get('command_check', 4.0)
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
@@ -144,6 +149,9 @@ class KachakaApiClientByZenoh:
         self.last_command = None
         self.last_command_result = None
         self.last_command_id = None
+        self.current_command_id = None
+        self.is_async_command = False
+        self.saw_running = False
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -189,6 +197,21 @@ class KachakaApiClientByZenoh:
             self.logger.error(f'RPC error in {method_name}: {e.details()}')
             raise
 
+    def _log_info(self, message: str) -> None:
+        """Log info message and print to console."""
+        self.logger.info(message)
+        print(message)
+
+    def _log_warning(self, message: str) -> None:
+        """Log warning message and print to console."""
+        self.logger.warning(message)
+        print(message)
+
+    def _log_error_msg(self, message: str) -> None:
+        """Log error message and print to console."""
+        self.logger.error(message)
+        print(message)
+
     def _log_error(self, error_type: str, method_name: str, error: Exception) -> None:
         """Log an error with consistent formatting.
 
@@ -200,9 +223,7 @@ class KachakaApiClientByZenoh:
         error_msg = f'{error_type} error during {method_name}: {str(error)}'
         if isinstance(error, RpcError):
             error_msg = f'{error_type} error during {method_name}: {error.details()}'
-
-        self.logger.error(error_msg)
-        print(error_msg)
+        self._log_error_msg(error_msg)
 
     def _publish_to_zenoh(self, publisher: zenoh.Publisher, data: Union[Dict, List, str, int, float, bool]) -> bool:
         """Publish data to a Zenoh topic with consistent encoding.
@@ -214,10 +235,46 @@ class KachakaApiClientByZenoh:
         try:
             publisher.put(json.dumps(data).encode(), encoding=zenoh.Encoding.APPLICATION_JSON)
         except Exception as e:
-            self.logger.error(f'Failed to publish data to Zenoh: {str(e)}')
-            print(f'Failed to publish data to Zenoh: {str(e)}')
+            self._log_error_msg(f'Failed to publish data to Zenoh: {str(e)}')
             return False
         return True
+
+    def _get_command_state_response(self) -> Dict[str, Any]:
+        """Fetch the latest command state including command_id."""
+        try:
+            response = self.kachaka_client.stub.GetCommandState(pb2.GetRequest())
+            return MessageToDict(response)
+        except RpcError as e:
+            self._log_error('RPC', 'get_command_state', e)
+            raise
+
+    def _get_last_command_result_response(self) -> Dict[str, Any]:
+        """Fetch the most recent command result including command_id."""
+        try:
+            response = self.kachaka_client.stub.GetLastCommandResult(pb2.GetRequest())
+            return MessageToDict(response)
+        except RpcError as e:
+            self._log_error('RPC', 'get_last_command_result', e)
+            raise
+
+    def _is_running_state(self, state_value: Union[str, int, None]) -> bool:
+        """Return True if the provided state represents RUNNING."""
+        if isinstance(state_value, str):
+            return state_value.upper() == 'COMMAND_STATE_RUNNING'
+        if isinstance(state_value, int):
+            return state_value == pb2.CommandState.Value('COMMAND_STATE_RUNNING')
+        return False
+
+    def _update_current_command_id(self, response: Optional[Dict[str, Any]], method_name: str) -> None:
+        """Extract and store command_id for async commands if available."""
+        if not isinstance(response, dict):
+            return
+        command_id = response.get('commandId')
+        if command_id:
+            self.current_command_id = command_id
+            self.logger.debug(f'Captured command_id {command_id} for {method_name}')
+        else:
+            self.logger.warning(f'Async command {method_name} did not return commandId; awaiting state update')
 
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
@@ -240,8 +297,7 @@ class KachakaApiClientByZenoh:
                 self.last_pose = pose
             except KeyError:
                 # Handle unexpected format or missing data appropriately
-                self.logger.error(f'{pose_raw} is unexpected response format')
-                print(f'{pose_raw} is unexpected response format')
+                self._log_error_msg(f'{pose_raw} is unexpected response format')
                 return
 
             self._publish_to_zenoh(self.pose_pub, pose)
@@ -270,8 +326,7 @@ class KachakaApiClientByZenoh:
                 battery = res[0] / 100.0
                 self.last_battery = battery
             else:
-                self.logger.error(f'Unexpected battery info format: {res}')
-                print(f'Unexpected battery info format: {res}')
+                self._log_error_msg(f'Unexpected battery info format: {res}')
                 return
 
             self._publish_to_zenoh(self.battery_pub, battery)
@@ -315,48 +370,98 @@ class KachakaApiClientByZenoh:
             self._log_error('Unexpected', method_name, e)
 
     async def publish_result(self) -> None:
-        """Publish the last command completion status to Zenoh.
+        """Publish command completion status to Zenoh.
 
-        Checks the status of the most recently executed command and publishes
-        its completion status (true/false) to Zenoh along with the task ID.
-
-        Only publishes if there is an active task (task_id is set).
-        The task_id is set when a command is received via the Zenoh command topic.
-
-        The published result has the format:
-        {
-            "id": "<task_id>",
-            "is_completed": true/false
-        }
-
-        Handles connection errors and unexpected response formats.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
+        Monitors active async commands and publishes their completion status.
+        Uses command_id to ensure state/result pairs belong to the active command.
         """
         method_name = 'publish_result'
         try:
             if not self.task_id:
-                # No active task to check
+                # Keep publishing last result for Pub/Sub reliability.
+                # Fleet adapter's ID check ensures stale completions are ignored.
+                if self.last_command_result:
+                    self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
                 return
 
-            res = await self.run_method('get_command_state')
-            result = {'id': self.task_id, 'is_completed': False}
+            if not self.grpc_connection_check():
+                raise ConnectionError('Failed to connect to Kachaka API server for publish_result')
 
-            if isinstance(res, (list, tuple)) and len(res) > 0 and isinstance(res[0], int):
-                result['is_completed'] = True if res[0] != 2 else False
+            state_res = self._get_command_state_response()
+            self.logger.debug(f'GetCommandState response: {state_res}')
+            command_id = state_res.get('commandId')
+            state_value = state_res.get('state')
+
+            if self.is_async_command:
+                if command_id:
+                    if self.current_command_id is None and self._is_running_state(state_value):
+                        self.current_command_id = command_id
+                        self.logger.debug(f'Bound command_id {command_id} to task {self.task_id}')
+                    elif self.current_command_id and command_id != self.current_command_id:
+                        self.logger.debug(
+                            'Ignoring command state for command_id %s (expecting %s)',
+                            command_id,
+                            self.current_command_id,
+                        )
+                        return
+                else:
+                    self.logger.debug('Command state missing commandId for task %s (state=%s)', self.task_id,
+                                      state_value)
+
+            if self._is_running_state(state_value):
+                self.saw_running = True
+                result = {'id': self.task_id, 'is_completed': False, 'success': None, 'error_code': None}
+                self.last_command_result = result
+                self._publish_to_zenoh(self.command_is_completed_pub, result)
+                return
+
+            if self.is_async_command and not self.saw_running:
+                self.logger.debug('Async command: waiting to see RUNNING state first')
+                return
+
+            last_result = self._get_last_command_result_response()
+            self.logger.debug(f'GetLastCommandResult response: {last_result}')
+            result_command_id = last_result.get('commandId')
+
+            if self.is_async_command:
+                if result_command_id:
+                    if self.current_command_id is None and self.saw_running:
+                        self.current_command_id = result_command_id
+                        self.logger.debug(f'Bound result command_id {result_command_id} to task {self.task_id}')
+                    elif self.current_command_id and result_command_id != self.current_command_id:
+                        self.logger.debug(
+                            'Ignoring result for command_id %s (expecting %s)',
+                            result_command_id,
+                            self.current_command_id,
+                        )
+                        return
+                else:
+                    self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
+
+            cmd_result = last_result.get('result')
+            if not isinstance(cmd_result, dict):
+                self._log_error_msg(f'Unexpected last command result format: {last_result}')
+                result = {'id': self.task_id, 'is_completed': True, 'success': False, 'error_code': -1}
             else:
-                # Handle unexpected format or missing data appropriately
-                self.logger.error(f'Unexpected command state format: {res}')
-                print(f'Unexpected command state format: {res}')
-                return
+                success = cmd_result.get('success', False)
+                error_code = cmd_result.get('errorCode', 0)
+                result = {
+                    'id': self.task_id,
+                    'is_completed': True,
+                    'success': success,
+                    'error_code': error_code,
+                }
 
-            self.logger.debug(f'Command {self.task_id} completed: {result["is_completed"]}')
+                if success:
+                    self._log_info(f'Command {self.task_id} succeeded')
+                else:
+                    self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
+
+            # Publish and reset
             self.last_command_result = result
-            put_result = self._publish_to_zenoh(self.command_is_completed_pub, result)
-            # Reset task_id if the command is completed
-            if put_result and result['is_completed']:
-                self.task_id = None
+            if self._publish_to_zenoh(self.command_is_completed_pub, result) and result['is_completed']:
+                self._reset_async_command_state()
+
         except ConnectionError as e:
             self._log_error('Connection', method_name, e)
         except RpcError as e:
@@ -420,8 +525,7 @@ class KachakaApiClientByZenoh:
 
                         # Check if this is a new command
                         if command_id and command_id != self.last_command_id:
-                            self.logger.info(f'Received new command: {command}')
-                            print(f'New command: {command["method"]} (ID: {command_id})')
+                            self._log_info(f'New command: {command["method"]} (ID: {command_id})')
 
                             # Update last command ID to prevent duplicate processing
                             self.last_command_id = command_id
@@ -430,8 +534,7 @@ class KachakaApiClientByZenoh:
                             try:
                                 self._execute_command(command)
                             except Exception as e:
-                                self.logger.error(f'Error processing command: {str(e)}')
-                                print(f'Error processing command: {str(e)}')
+                                self._log_error_msg(f'Error processing command: {str(e)}')
                         else:
                             self.logger.debug(f'Skipping duplicate command ID: {command_id}')
                     else:
@@ -448,6 +551,30 @@ class KachakaApiClientByZenoh:
             # Wait before next check
             await asyncio.sleep(self.command_check_interval)
 
+    def _prepare_async_command_args(self,
+                                    args: Dict[str, Any],
+                                    defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Prepare arguments for async StartCommand methods.
+
+        Sets wait_for_completion=False by default and updates is_async_command flag.
+
+        Args:
+            args: Original command arguments
+            defaults: Additional default values to set if not present
+
+        Returns:
+            Prepared arguments dict
+        """
+        prepared = args.copy() if args else {}
+        if defaults:
+            for key, value in defaults.items():
+                if key not in prepared:
+                    prepared[key] = value
+        if 'wait_for_completion' not in prepared:
+            prepared['wait_for_completion'] = False
+        self.is_async_command = not prepared.get('wait_for_completion', True)
+        return prepared
+
     def _execute_command(self, command: Dict[str, Any]) -> None:
         """Unified command execution logic."""
         method_name = 'execute_command'
@@ -462,32 +589,41 @@ class KachakaApiClientByZenoh:
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f'Invalid method: {method_name}')
 
-            self.logger.info(f'Executing command: {method_name} (ID: {self.task_id})')
-            print(f'Executing: {method_name}')
+            self._log_info(f'Executing command: {method_name} (ID: {self.task_id})')
             self.last_command = command
             self.last_command_result = None
+            self.current_command_id = None
 
             # Execute the command
             if method_name == 'switch_map':
-                args = command['args']
-                self._execute_switch_map_sync(args)
+                self._execute_switch_map_sync(command['args'])
             elif method_name == 'move_to_pose':
-                args = command['args']
+                args = command['args'].copy()
                 map_name = args.pop('map_name', None)
                 if map_name is not None and map_name != self.map_name:
-                    self.logger.warning(f'Map name {map_name} does not match current map {self.map_name}')
+                    # Map name mismatch indicates RMF has incorrect floor information.
+                    # Reject the navigation command and return error to trigger replanning.
+                    self._log_warning(
+                        f'Map name mismatch: requested={map_name}, current={self.map_name}. '
+                        f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
+                    self._publish_command_completion(success=False, error_code=-2)
                     return
-                if 'cancel_all' not in args:
-                    args['cancel_all'] = True
-                if 'wait_for_completion' not in args:
-                    args['wait_for_completion'] = False
-                self.logger.debug(f'move_to_pose args: {args}')
-                self._execute_sync_method(method_name, args)
+                args = self._prepare_async_command_args(args, {'cancel_all': True})
+                self.logger.debug(f'Current pose: {self.last_pose}')
+                self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
+                response = self._execute_sync_method(method_name, args)
+                if self.is_async_command:
+                    self._update_current_command_id(response, method_name)
+            elif method_name == 'return_home':
+                args = self._prepare_async_command_args(command['args'])
+                response = self._execute_sync_method(method_name, args)
+                if self.is_async_command:
+                    self._update_current_command_id(response, method_name)
             else:
+                self.logger.debug(f'{method_name} args: {command["args"]}')
                 self._execute_sync_method(method_name, command['args'])
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
-            self.logger.error(f'Invalid command: {str(e)}')
-            print(f'Invalid command: {str(e)}')
+            self._log_error_msg(f'Invalid command: {str(e)}')
         except (ConnectionError, RpcError, Exception) as e:
             self._log_error('Unexpected', f'executing command {method_name}', e)
 
@@ -511,8 +647,8 @@ class KachakaApiClientByZenoh:
             map_id = next((item['id'] for item in map_list if item['name'] == map_name), None)
 
             if map_id is None:
-                self.logger.error(f'Map {map_name} not found')
-                print(f'Map {map_name} not found')
+                self._log_error_msg(f'Map {map_name} not found')
+                self._publish_command_completion(success=False, error_code=-1)
                 return
 
             current_map_id = self.kachaka_client.get_current_map_id()
@@ -522,37 +658,107 @@ class KachakaApiClientByZenoh:
             # because switch_map method takes long time to complete
             if map_id == current_map_id:
                 self.logger.info('Nothing to do - already on target map')
+                self._publish_command_completion(success=True, error_code=0)
             else:
-                self._execute_sync_method('switch_map', payload)
-                self.logger.info(f'Switched to map {map_name}', payload['pose'])
+                response = self._execute_sync_method('switch_map', payload)
+                # Success/failure logging and notification handled by _execute_sync_method
+                # Update map_name immediately after successful switch_map
+                if response and isinstance(response, dict) and response.get('result', {}).get('success', False):
+                    self.map_name = args.get('map_name')
+                    self.logger.info(f'Updated self.map_name to {self.map_name} after successful switch_map')
         except RpcError as e:
             self._log_error('RPC', method_name, e)
+            self._publish_command_completion(success=False, error_code=-1)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
+            self._publish_command_completion(success=False, error_code=-1)
 
-    def _execute_sync_method(self, method_name: str, args: Dict[str, Any]) -> None:
-        """Execute a method synchronously without asyncio.run().
+    def _execute_sync_method(self, method_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a method synchronously and publish completion status.
 
         Args:
             method_name (str): The name of the method to execute
             args (Dict[str, Any]): The arguments for the method
+
+        Returns:
+            Dict[str, Any]: The response from the method
         """
         try:
             if not self.grpc_connection_check():
                 error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
                 self.logger.error(error_msg)
+                if self.task_id:
+                    self._publish_command_completion(success=False, error_code=-1)
                 raise ConnectionError(error_msg)
 
             method = getattr(self.kachaka_client, method_name)
             response = self._to_dict(method(**args))
-            self.logger.info(f'Command {method_name} executed successfully')
+
+            # Check if response contains a 'result' field (synchronous commands return Result)
+            if isinstance(response, dict) and 'result' in response:
+                result = response['result']
+                success = result.get('success', False)
+                # Note: MessageToDict converts snake_case to camelCase
+                error_code = result.get('errorCode', 0)
+
+                if self.is_async_command and success:
+                    # Async command started, don't publish completion yet
+                    # publish_result will handle completion after RUNNING state is seen
+                    self.logger.info(f'Async command {method_name} started')
+                elif success:
+                    self.logger.info(f'Command {method_name} completed successfully')
+                    # Synchronous command completed successfully
+                    self._publish_command_completion(success=True, error_code=0)
+                else:
+                    self._log_warning(f'Command {method_name} failed with error_code={error_code}')
+                    # Always publish failure immediately
+                    self._publish_command_completion(success=False, error_code=error_code)
+            else:
+                # No result field (e.g., query methods), assume success
+                self.logger.info(f'Command {method_name} executed successfully')
+
             return response
+
         except RpcError as e:
             self.logger.error(f'RPC error in {method_name}: {e.details()}')
+            if self.task_id:
+                self._publish_command_completion(success=False, error_code=-1)
             raise
         except Exception as e:
             self.logger.error(f'Unexpected error in {method_name}: {str(e)}')
+            if self.task_id:
+                self._publish_command_completion(success=False, error_code=-1)
             raise
+
+    def _reset_async_command_state(self) -> None:
+        """Reset all async command tracking state.
+
+        Called after command completion (success or failure) to prepare
+        for the next command.
+        """
+        self.task_id = None
+        self.is_async_command = False
+        self.saw_running = False
+        self.current_command_id = None
+
+    def _publish_command_completion(self, success: bool, error_code: int) -> None:
+        """Publish command completion status to Zenoh.
+
+        Args:
+            success (bool): Whether the command succeeded
+            error_code (int): The error code (0 if success)
+        """
+        if not self.task_id:
+            return
+
+        completion_result = {'id': self.task_id, 'is_completed': True, 'success': success, 'error_code': error_code}
+
+        self.last_command_result = completion_result
+        self.logger.debug(f'Publishing command completion: {completion_result}')
+        self._publish_to_zenoh(self.command_is_completed_pub, completion_result)
+
+        # Clear all async command tracking state after publishing
+        self._reset_async_command_state()
 
     def grpc_connection_check(self, max_retries: Optional[int] = None) -> bool:
         """Check if the gRPC connection to Kachaka API server is alive.
@@ -586,8 +792,7 @@ class KachakaApiClientByZenoh:
             try:
                 self.kachaka_client.get_robot_pose()
                 if retry_count > 0:
-                    self.logger.info(f'gRPC connection restored after {retry_count} retries')
-                    print(f'gRPC connection restored after {retry_count} retries')
+                    self._log_info(f'gRPC connection restored after {retry_count} retries')
                 return True
             except RpcError as e:
                 retry_count += 1
@@ -596,19 +801,18 @@ class KachakaApiClientByZenoh:
                 self._publish_to_zenoh(self.pose_pub, self.last_pose)
                 self._publish_to_zenoh(self.battery_pub, self.last_battery)
                 self._publish_to_zenoh(self.map_name_pub, self.map_name)
+                if self.last_command_result:
+                    self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
                 if e.code() == StatusCode.UNAVAILABLE:
-                    self.logger.error(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
-                    print(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
+                    self._log_error_msg(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
                     time.sleep(sleep_time)
                 else:
-                    self.logger.error(f'Unexpected gRPC error: {e.details()} (code: {e.code()})')
-                    print(f'Unexpected gRPC error: {e.details()} (code: {e.code()})')
+                    self._log_error_msg(f'Unexpected gRPC error: {e.details()} (code: {e.code()})')
                     raise e
 
         error_details = last_error.details() if last_error else 'Unknown error'
-        self.logger.error(
+        self._log_error_msg(
             f'Failed to connect to gRPC server after {max_retries} attempts. Last error: {error_details}')
-        print(f'Failed to connect to gRPC server after {max_retries} attempts')
         return False
 
 
@@ -644,8 +848,9 @@ def _handle_main_loop_error(
         node.logger.error(f'Unexpected error in main loop: {str(error)}')
 
     if consecutive_errors >= max_consecutive_errors:
-        node.logger.error(f'Too many consecutive errors ({consecutive_errors}), exiting')
-        print(f'Too many consecutive errors ({consecutive_errors}), exiting')
+        msg = f'Too many consecutive errors ({consecutive_errors}), exiting'
+        node.logger.error(msg)
+        print(msg)
         raise error
 
     return consecutive_errors
@@ -683,8 +888,9 @@ def main() -> None:
 
         try:
             # Start the node with periodic command checking via Queryable pattern
-            print('Starting KachakaApiClientByZenoh with periodic command checking...')
-            node.logger.info('Starting KachakaApiClientByZenoh with periodic command checking...')
+            msg = 'Starting KachakaApiClientByZenoh with periodic command checking...'
+            node.logger.info(msg)
+            print(msg)
 
             consecutive_errors = 0
             max_consecutive_errors = node.max_consecutive_errors

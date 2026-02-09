@@ -25,5 +25,13 @@ connection:
   max_retries: 20           # Max gRPC connection retries
   max_consecutive_errors: 10  # Exit after this many consecutive errors
 
+# Navigation retry settings
+navigation_retry:
+  enabled: true             # Enable automatic retry on navigation failure
+  max_retries: 3            # Maximum number of retry attempts
+  retry_interval: 2.0       # Wait time (seconds) before retrying
+  retry_on_error_types:     # Error types that trigger automatic retry
+    - Error                 # Retriable errors (may succeed on retry)
+
 # Optional: Custom Zenoh config file path
 # zenoh_config: "/path/to/zenoh.json5"

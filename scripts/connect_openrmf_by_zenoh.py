@@ -66,6 +66,11 @@ class KachakaApiClientByZenoh:
     saw_running: bool
     command_check_interval: float
     logger: logging.Logger
+    retry_enabled: bool
+    max_navigation_retries: int
+    retry_interval: float
+    retry_on_error_types: List[str]
+    retry_count: int
 
     def __init__(
         self,
@@ -103,6 +108,7 @@ class KachakaApiClientByZenoh:
         timeouts = config.get('timeouts', {})
         intervals = config.get('intervals', {})
         connection = config.get('connection', {})
+        navigation_retry = config.get('navigation_retry', {})
 
         self.command_query_timeout = timeouts.get('command_query', 2.0)
         self.grpc_connection_sleep = timeouts.get('grpc_connection', 5)
@@ -111,6 +117,12 @@ class KachakaApiClientByZenoh:
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
         self.max_consecutive_errors = connection.get('max_consecutive_errors', 10)
+
+        # Load navigation retry settings
+        self.retry_enabled = navigation_retry.get('enabled', True)
+        self.max_navigation_retries = navigation_retry.get('max_retries', 3)
+        self.retry_interval = navigation_retry.get('retry_interval', 2.0)
+        self.retry_on_error_types = navigation_retry.get('retry_on_error_types', ['Error'])
         self.kachaka_client = (kachaka_api.KachakaApiClient(kachaka_access_point)
                                if kachaka_access_point else kachaka_api.KachakaApiClient())
         self.robot_name = robot_name
@@ -152,6 +164,7 @@ class KachakaApiClientByZenoh:
         self.current_command_id = None
         self.is_async_command = False
         self.saw_running = False
+        self.retry_count = 0
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -369,6 +382,34 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
+    async def _handle_command_retry(self, error_code: int) -> bool:
+        """Handle retry logic for failed commands.
+
+        Args:
+            error_code: The error code from the failed command
+
+        Returns:
+            True if retry was initiated (caller should return early), False otherwise
+        """
+        if not self.retry_enabled or self.retry_count >= self.max_navigation_retries:
+            if self.retry_count >= self.max_navigation_retries:
+                self._log_error_msg(f'Max retries ({self.max_navigation_retries}) exceeded for command {self.task_id}')
+            return False
+
+        should_retry = await self._should_retry_command(error_code)
+        if not should_retry:
+            self._log_info(f'Error code {error_code} is not retriable')
+            return False
+
+        self.retry_count += 1
+        self._log_info(f'Retrying command (attempt {self.retry_count}/{self.max_navigation_retries})')
+
+        await asyncio.sleep(self.retry_interval)
+        if self.last_command:
+            self._execute_command(self.last_command)
+            return True
+        return False
+
     async def publish_result(self) -> None:
         """Publish command completion status to Zenoh.
 
@@ -454,8 +495,11 @@ class KachakaApiClientByZenoh:
 
                 if success:
                     self._log_info(f'Command {self.task_id} succeeded')
+                    self.retry_count = 0
                 else:
                     self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
+                    if await self._handle_command_retry(error_code):
+                        return  # Retry initiated, don't publish yet
 
             # Publish and reset
             self.last_command_result = result
@@ -468,6 +512,49 @@ class KachakaApiClientByZenoh:
             self._log_error('RPC', method_name, e)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
+
+    async def _should_retry_command(self, error_code: int) -> bool:
+        """Determine if a command should be retried based on its error code.
+
+        Args:
+            error_code (int): The error code from the failed command
+
+        Returns:
+            bool: True if the command should be retried, False otherwise
+        """
+        try:
+            # error_code=0 with success=False typically means the navigation was cancelled
+            # (e.g., due to temporary obstacles from LiDAR noise). This should be retried.
+            if error_code == 0:
+                self.logger.info('error_code=0 with failure - navigation may have been cancelled, will retry')
+                return True
+
+            # Get error code details from Kachaka API
+            error_code_dict = await self.run_method('get_robot_error_code')
+
+            if not isinstance(error_code_dict, dict):
+                self.logger.warning(f'Unexpected error code dict format: {error_code_dict}')
+                # If we can't get error details, allow retry
+                return True
+
+            # Look up the error code
+            error_info = error_code_dict.get(str(error_code))
+            if not error_info:
+                self.logger.warning(f'Error code {error_code} not found in error code dictionary')
+                # Unknown error code, allow retry
+                return True
+
+            # Get the error type
+            error_type = error_info.get('errorType', '')
+            self._log_info(f'Error code {error_code}: type={error_type}, title={error_info.get("title", "")}')
+
+            # Check if this error type should trigger a retry
+            return error_type in self.retry_on_error_types
+
+        except Exception as e:
+            self.logger.error(f'Error checking if command should retry: {str(e)}')
+            # On error, be conservative and allow retry
+            return True
 
     def _to_dict(
         self, response: Union[dict, list, RepeatedCompositeContainer,
@@ -593,6 +680,7 @@ class KachakaApiClientByZenoh:
             self.last_command = command
             self.last_command_result = None
             self.current_command_id = None
+            self.retry_count = 0
 
             # Execute the command
             if method_name == 'switch_map':
@@ -737,6 +825,7 @@ class KachakaApiClientByZenoh:
         for the next command.
         """
         self.task_id = None
+        self.retry_count = 0
         self.is_async_command = False
         self.saw_running = False
         self.current_command_id = None

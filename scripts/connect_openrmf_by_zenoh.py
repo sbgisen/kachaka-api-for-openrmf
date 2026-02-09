@@ -165,6 +165,7 @@ class KachakaApiClientByZenoh:
         self.is_async_command = False
         self.saw_running = False
         self.retry_count = 0
+        self._command_lock = threading.RLock()
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -418,93 +419,91 @@ class KachakaApiClientByZenoh:
         """
         method_name = 'publish_result'
         try:
-            if not self.task_id:
-                # Keep publishing last result for Pub/Sub reliability.
-                # Fleet adapter's ID check ensures stale completions are ignored.
-                if self.last_command_result:
-                    self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
-                return
+            with self._command_lock:
+                if not self.task_id:
+                    # Keep publishing last result for Pub/Sub reliability.
+                    # Fleet adapter's ID check ensures stale completions are ignored.
+                    if self.last_command_result:
+                        self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
+                    return
 
-            if not self.grpc_connection_check():
-                raise ConnectionError('Failed to connect to Kachaka API server for publish_result')
+                state_res = self._get_command_state_response()
+                self.logger.debug(f'GetCommandState response: {state_res}')
+                command_id = state_res.get('commandId')
+                state_value = state_res.get('state')
 
-            state_res = self._get_command_state_response()
-            self.logger.debug(f'GetCommandState response: {state_res}')
-            command_id = state_res.get('commandId')
-            state_value = state_res.get('state')
+                if self.is_async_command:
+                    if command_id:
+                        if self.current_command_id is None and self._is_running_state(state_value):
+                            self.current_command_id = command_id
+                            self.logger.debug(f'Bound command_id {command_id} to task {self.task_id}')
+                        elif self.current_command_id and command_id != self.current_command_id:
+                            self.logger.debug(
+                                'Ignoring command state for command_id %s (expecting %s)',
+                                command_id,
+                                self.current_command_id,
+                            )
+                            return
+                    else:
+                        self.logger.debug('Command state missing commandId for task %s (state=%s)', self.task_id,
+                                          state_value)
 
-            if self.is_async_command:
-                if command_id:
-                    if self.current_command_id is None and self._is_running_state(state_value):
-                        self.current_command_id = command_id
-                        self.logger.debug(f'Bound command_id {command_id} to task {self.task_id}')
-                    elif self.current_command_id and command_id != self.current_command_id:
-                        self.logger.debug(
-                            'Ignoring command state for command_id %s (expecting %s)',
-                            command_id,
-                            self.current_command_id,
-                        )
-                        return
+                if self._is_running_state(state_value):
+                    self.saw_running = True
+                    result = {'id': self.task_id, 'is_completed': False, 'success': None, 'error_code': None}
+                    self.last_command_result = result
+                    self._publish_to_zenoh(self.command_is_completed_pub, result)
+                    return
+
+                if self.is_async_command and not self.saw_running:
+                    self.logger.debug('Async command: waiting to see RUNNING state first')
+                    return
+
+                last_result = self._get_last_command_result_response()
+                self.logger.debug(f'GetLastCommandResult response: {last_result}')
+                result_command_id = last_result.get('commandId')
+
+                if self.is_async_command:
+                    if result_command_id:
+                        if self.current_command_id is None and self.saw_running:
+                            self.current_command_id = result_command_id
+                            self.logger.debug(f'Bound result command_id {result_command_id} to task {self.task_id}')
+                        elif self.current_command_id and result_command_id != self.current_command_id:
+                            self.logger.debug(
+                                'Ignoring result for command_id %s (expecting %s)',
+                                result_command_id,
+                                self.current_command_id,
+                            )
+                            return
+                    else:
+                        self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
+
+                cmd_result = last_result.get('result')
+                if not isinstance(cmd_result, dict):
+                    self._log_error_msg(f'Unexpected last command result format: {last_result}')
+                    result = {'id': self.task_id, 'is_completed': True, 'success': False, 'error_code': -1}
                 else:
-                    self.logger.debug('Command state missing commandId for task %s (state=%s)', self.task_id,
-                                      state_value)
+                    success = cmd_result.get('success', False)
+                    error_code = cmd_result.get('errorCode', 0)
+                    result = {
+                        'id': self.task_id,
+                        'is_completed': True,
+                        'success': success,
+                        'error_code': error_code,
+                    }
 
-            if self._is_running_state(state_value):
-                self.saw_running = True
-                result = {'id': self.task_id, 'is_completed': False, 'success': None, 'error_code': None}
+                    if success:
+                        self._log_info(f'Command {self.task_id} succeeded')
+                        self.retry_count = 0
+                    else:
+                        self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
+                        if await self._handle_command_retry(error_code):
+                            return  # Retry initiated, don't publish yet
+
+                # Publish and reset
                 self.last_command_result = result
-                self._publish_to_zenoh(self.command_is_completed_pub, result)
-                return
-
-            if self.is_async_command and not self.saw_running:
-                self.logger.debug('Async command: waiting to see RUNNING state first')
-                return
-
-            last_result = self._get_last_command_result_response()
-            self.logger.debug(f'GetLastCommandResult response: {last_result}')
-            result_command_id = last_result.get('commandId')
-
-            if self.is_async_command:
-                if result_command_id:
-                    if self.current_command_id is None and self.saw_running:
-                        self.current_command_id = result_command_id
-                        self.logger.debug(f'Bound result command_id {result_command_id} to task {self.task_id}')
-                    elif self.current_command_id and result_command_id != self.current_command_id:
-                        self.logger.debug(
-                            'Ignoring result for command_id %s (expecting %s)',
-                            result_command_id,
-                            self.current_command_id,
-                        )
-                        return
-                else:
-                    self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
-
-            cmd_result = last_result.get('result')
-            if not isinstance(cmd_result, dict):
-                self._log_error_msg(f'Unexpected last command result format: {last_result}')
-                result = {'id': self.task_id, 'is_completed': True, 'success': False, 'error_code': -1}
-            else:
-                success = cmd_result.get('success', False)
-                error_code = cmd_result.get('errorCode', 0)
-                result = {
-                    'id': self.task_id,
-                    'is_completed': True,
-                    'success': success,
-                    'error_code': error_code,
-                }
-
-                if success:
-                    self._log_info(f'Command {self.task_id} succeeded')
-                    self.retry_count = 0
-                else:
-                    self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
-                    if await self._handle_command_retry(error_code):
-                        return  # Retry initiated, don't publish yet
-
-            # Publish and reset
-            self.last_command_result = result
-            if self._publish_to_zenoh(self.command_is_completed_pub, result) and result['is_completed']:
-                self._reset_async_command_state()
+                if self._publish_to_zenoh(self.command_is_completed_pub, result) and result['is_completed']:
+                    self._reset_async_command_state()
 
         except ConnectionError as e:
             self._log_error('Connection', method_name, e)
@@ -666,50 +665,51 @@ class KachakaApiClientByZenoh:
         """Unified command execution logic."""
         method_name = 'execute_command'
         try:
-            if not all(k in command for k in ('method', 'args')):
-                raise ValueError('Invalid command structure')
+            with self._command_lock:
+                if not all(k in command for k in ('method', 'args')):
+                    raise ValueError('Invalid command structure')
 
-            method_name = command['method']
-            method_name = self.method_mapping.get(method_name, method_name)
-            self.task_id = command.get('id', None)
+                method_name = command['method']
+                method_name = self.method_mapping.get(method_name, method_name)
+                self.task_id = command.get('id', None)
 
-            if not hasattr(self.kachaka_client, method_name):
-                raise AttributeError(f'Invalid method: {method_name}')
+                if not hasattr(self.kachaka_client, method_name):
+                    raise AttributeError(f'Invalid method: {method_name}')
 
-            self._log_info(f'Executing command: {method_name} (ID: {self.task_id})')
-            self.last_command = command
-            self.last_command_result = None
-            self.current_command_id = None
-            self.retry_count = 0
+                self._log_info(f'Executing command: {method_name} (ID: {self.task_id})')
+                self.last_command = command
+                self.last_command_result = None
+                self.current_command_id = None
+                self.retry_count = 0
 
-            # Execute the command
-            if method_name == 'switch_map':
-                self._execute_switch_map_sync(command['args'])
-            elif method_name == 'move_to_pose':
-                args = command['args'].copy()
-                map_name = args.pop('map_name', None)
-                if map_name is not None and map_name != self.map_name:
-                    # Map name mismatch indicates RMF has incorrect floor information.
-                    # Reject the navigation command and return error to trigger replanning.
-                    self._log_warning(
-                        f'Map name mismatch: requested={map_name}, current={self.map_name}. '
-                        f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
-                    self._publish_command_completion(success=False, error_code=-2)
-                    return
-                args = self._prepare_async_command_args(args, {'cancel_all': True})
-                self.logger.debug(f'Current pose: {self.last_pose}')
-                self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
-                response = self._execute_sync_method(method_name, args)
-                if self.is_async_command:
-                    self._update_current_command_id(response, method_name)
-            elif method_name == 'return_home':
-                args = self._prepare_async_command_args(command['args'])
-                response = self._execute_sync_method(method_name, args)
-                if self.is_async_command:
-                    self._update_current_command_id(response, method_name)
-            else:
-                self.logger.debug(f'{method_name} args: {command["args"]}')
-                self._execute_sync_method(method_name, command['args'])
+                # Execute the command
+                if method_name == 'switch_map':
+                    self._execute_switch_map_sync(command['args'])
+                elif method_name == 'move_to_pose':
+                    args = command['args'].copy()
+                    map_name = args.pop('map_name', None)
+                    if map_name is not None and map_name != self.map_name:
+                        # Map name mismatch indicates RMF has incorrect floor information.
+                        # Reject the navigation command and return error to trigger replanning.
+                        self._log_warning(
+                            f'Map name mismatch: requested={map_name}, current={self.map_name}. '
+                            f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
+                        self._publish_command_completion(success=False, error_code=-2)
+                        return
+                    args = self._prepare_async_command_args(args, {'cancel_all': True})
+                    self.logger.debug(f'Current pose: {self.last_pose}')
+                    self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
+                    response = self._execute_sync_method(method_name, args)
+                    if self.is_async_command:
+                        self._update_current_command_id(response, method_name)
+                elif method_name == 'return_home':
+                    args = self._prepare_async_command_args(command['args'])
+                    response = self._execute_sync_method(method_name, args)
+                    if self.is_async_command:
+                        self._update_current_command_id(response, method_name)
+                else:
+                    self.logger.debug(f'{method_name} args: {command["args"]}')
+                    self._execute_sync_method(method_name, command['args'])
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             self._log_error_msg(f'Invalid command: {str(e)}')
         except (ConnectionError, RpcError, Exception) as e:

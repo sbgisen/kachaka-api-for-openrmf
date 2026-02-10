@@ -27,8 +27,10 @@ RUN_LINE="jupyter-lab --port=26501 --ip='0.0.0.0' & uvicorn sbgisen.rest_kachaka
 read -p "Do you want to set up the Zenoh client? (y/n) " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-  read -p "Enter the Zenoh router access point: " ZENOH_ROUTER_ACCESS_POINT
+  read -p "Enter the Zenoh router access point (IP:Port, e.g., 192.168.1.100:7447): " ZENOH_ROUTER_ACCESS_POINT
   read -p "Enter the robot name: " ROBOT_NAME
+  read -p "Enter log level (DEBUG/INFO/WARNING/ERROR/CRITICAL) [INFO]: " LOG_LEVEL
+  LOG_LEVEL=${LOG_LEVEL:-INFO}
   RUN_LINE="$RUN_LINE & python3 sbgisen/connect_openrmf_by_zenoh.py"
 fi
 # Create the server setup script with dynamic KACHAKA_IP
@@ -42,6 +44,7 @@ if [ -n "$KACHAKA_IP" ]; then
 fi
 export ZENOH_ROUTER_ACCESS_POINT=$ZENOH_ROUTER_ACCESS_POINT
 export ROBOT_NAME=$ROBOT_NAME
+export LOG_LEVEL=$LOG_LEVEL
 export PATH=/home/kachaka/.local/bin:\$PATH
 $RUN_LINE
 EOF

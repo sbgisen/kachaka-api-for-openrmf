@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import asyncio
 import json
 import logging
@@ -68,6 +69,7 @@ class KachakaApiClientByZenoh:
         kachaka_access_point: Optional[str] = None,
         robot_name: str = 'kachaka',
         config_file: str = 'config.yaml',
+        log_level: str = 'INFO',
     ) -> None:
         """Construct method.
 
@@ -80,7 +82,10 @@ class KachakaApiClientByZenoh:
                 Defaults to 'kachaka'.
             config_file (str): The name of the configuration file to load.
                 Defaults to 'config.yaml'.
+            log_level (str): The logging level. Defaults to 'INFO'.
+                Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.
         """
+        self.log_level = getattr(logging, log_level.upper(), logging.INFO)
         file_path = Path(__file__).resolve().parent
         config_path = file_path / '..' / 'config' if (file_path / '..' / 'config').exists() else file_path / 'config'
         with open(config_path / config_file, 'r') as f:
@@ -106,11 +111,12 @@ class KachakaApiClientByZenoh:
         self.robot_name = robot_name
         self.task_id = None
         logging.basicConfig(
-            level=logging.INFO,
+            level=self.log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
             filename='kachaka_api.log',
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(self.log_level)
 
         # Initialize Zenoh session and publishers in constructor
         self.session = zenoh.open(self._get_zenoh_config(zenoh_router))
@@ -381,7 +387,6 @@ class KachakaApiClientByZenoh:
         Args:
             query (zenoh.Query): The received query
         """
-
         try:
             status_data = {
                 'robot_name': self.robot_name,
@@ -456,7 +461,6 @@ class KachakaApiClientByZenoh:
 
             if not hasattr(self.kachaka_client, method_name):
                 raise AttributeError(f'Invalid method: {method_name}')
-
 
             self.logger.info(f'Executing command: {method_name} (ID: {self.task_id})')
             print(f'Executing: {method_name}')
@@ -654,15 +658,28 @@ def main() -> None:
     KachakaApiClientByZenoh, subscribes to the command topic, and publishes
     the robot's pose, current map name, and command state to Zenoh in a loop.
     """
+    parser = argparse.ArgumentParser(description='Kachaka API Client for OpenRMF via Zenoh')
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default=None,
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        help='Set the logging level (default: INFO, can also be set via LOG_LEVEL env var)',
+    )
+    args = parser.parse_args()
+
     zenoh_router_ap = os.getenv('ZENOH_ROUTER_ACCESS_POINT')
     kachaka_access_point = os.getenv('KACHAKA_ACCESS_POINT')
     robot_name = os.getenv('ROBOT_NAME', 'kachaka')
     config_file = os.getenv('CONFIG_FILE', 'config.yaml')
+    # Priority: CLI argument > environment variable > default (INFO)
+    log_level = args.log_level or os.getenv('LOG_LEVEL', 'INFO')
+
     if not zenoh_router_ap:
         raise ValueError('ZENOH_ROUTER_ACCESS_POINT must be set as an environment variable.')
 
     try:
-        node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name, config_file)
+        node = KachakaApiClientByZenoh(zenoh_router_ap, kachaka_access_point, robot_name, config_file, log_level)
 
         try:
             # Start the node with periodic command checking via Queryable pattern

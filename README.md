@@ -199,6 +199,42 @@ python test/test_kachaka_command.py 127.0.0.1:7447 kachaka dock
 - `connect_openrmf_by_zenoh.py` must be running on the robot
 - Robot must be connected to the same Zenoh network
 
+### Unit and Integration Tests
+
+The repository includes pytest-based tests for `KachakaApiClientByZenoh`.
+
+#### Running unit tests (no hardware required)
+
+```bash
+pytest test/test_kachaka_node.py -v -m "not integration"
+```
+
+#### Running integration tests (real Kachaka required)
+
+1. Start a Zenoh router on the host PC:
+
+```bash
+bash scripts/start_zenoh_router.sh
+```
+
+2. Set environment variables and run tests:
+
+```bash
+export KACHAKA_ACCESS_POINT=<kachaka_ip>:26400
+export ZENOH_ROUTER_ACCESS_POINT=<host_ip>:7447
+pytest test/test_kachaka_node.py -v
+```
+
+To find the host IP: `hostname -I | awk '{print $1}'`
+
+#### Test categories
+
+| Class | Description | Hardware |
+|---|---|---|
+| `TestIsRunningState` | Logic for `_is_running_state()` | Not required |
+| `TestPrepareAsyncCommandArgs` | Logic for `_prepare_async_command_args()` | Not required |
+| `TestExecuteCommandTracking` | Command execution and tracking | Required |
+
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for more details.

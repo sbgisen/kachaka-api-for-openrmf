@@ -114,6 +114,8 @@ class KachakaApiClientByZenoh:
         self.command_query_timeout = timeouts.get('command_query', 2.0)
         self.grpc_connection_sleep = timeouts.get('grpc_connection', 5)
         self.running_state_wait = timeouts.get('running_state_wait', 5.0)
+        self.grpc_telemetry_timeout = timeouts.get('grpc_telemetry', 5.0)
+        self.grpc_status_check_timeout = timeouts.get('grpc_status_check', 5.0)
         self.command_check_interval = intervals.get('command_check', 4.0)
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
@@ -258,7 +260,8 @@ class KachakaApiClientByZenoh:
     def _get_command_state_response(self) -> Dict[str, Any]:
         """Fetch the latest command state including command_id."""
         try:
-            response = self.kachaka_client.stub.GetCommandState(pb2.GetRequest())
+            response = self.kachaka_client.stub.GetCommandState(pb2.GetRequest(),
+                                                                timeout=self.grpc_status_check_timeout)
             return MessageToDict(response)
         except RpcError as e:
             self._log_error('RPC', 'get_command_state', e)
@@ -267,7 +270,8 @@ class KachakaApiClientByZenoh:
     def _get_last_command_result_response(self) -> Dict[str, Any]:
         """Fetch the most recent command result including command_id."""
         try:
-            response = self.kachaka_client.stub.GetLastCommandResult(pb2.GetRequest())
+            response = self.kachaka_client.stub.GetLastCommandResult(pb2.GetRequest(),
+                                                                     timeout=self.grpc_status_check_timeout)
             return MessageToDict(response)
         except RpcError as e:
             self._log_error('RPC', 'get_last_command_result', e)
@@ -301,93 +305,75 @@ class KachakaApiClientByZenoh:
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
 
-        Gets the robot's current pose from Kachaka API and publishes it to Zenoh.
-        The pose is formatted as a list [x, y, theta] where:
-        - x, y: position coordinates in meters
-        - theta: orientation in radians
-
-        Handles connection errors and unexpected response formats.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
+        Gets the robot's current pose from Kachaka API via gRPC stub with timeout
+        and publishes it to Zenoh. On timeout, publishes cached value to keep
+        the telemetry loop running.
         """
         method_name = 'publish_pose'
         try:
-            pose_raw = await self.run_method('get_robot_pose')
-            try:
-                pose = [pose_raw['x'], pose_raw['y'], pose_raw['theta']]
-                self.last_pose = pose
-            except KeyError:
-                # Handle unexpected format or missing data appropriately
-                self._log_error_msg(f'{pose_raw} is unexpected response format')
-                return
-
+            response = self.kachaka_client.stub.GetRobotPose(pb2.GetRequest(), timeout=self.grpc_telemetry_timeout)
+            pose = [response.pose.x, response.pose.y, response.pose.theta]
+            self.last_pose = pose
             self._publish_to_zenoh(self.pose_pub, pose)
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
         except RpcError as e:
-            self._log_error('RPC', method_name, e)
+            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+                self.logger.warning(f'Timeout in {method_name}, publishing cached value')
+                self._publish_to_zenoh(self.pose_pub, self.last_pose)
+            else:
+                self._log_error('RPC', method_name, e)
+                self._publish_to_zenoh(self.pose_pub, self.last_pose)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
     async def publish_battery(self) -> None:
         """Publish the current robot battery to Zenoh.
 
-        Gets battery information from Kachaka API and publishes it to Zenoh.
-        Battery level is normalized to a 0.0-1.0 range from the original percentage.
-
-        Handles connection errors and unexpected response formats.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
+        Gets battery information from Kachaka API via gRPC stub with timeout.
+        On timeout, publishes cached value to keep the telemetry loop running.
         """
         method_name = 'publish_battery'
         try:
-            res = await self.run_method('get_battery_info')
-            if isinstance(res, (list, tuple)) and len(res) > 0:
-                battery = res[0] / 100.0
-                self.last_battery = battery
-            else:
-                self._log_error_msg(f'Unexpected battery info format: {res}')
-                return
-
+            response = self.kachaka_client.stub.GetBatteryInfo(pb2.GetRequest(), timeout=self.grpc_telemetry_timeout)
+            battery = response.remaining_percentage / 100.0
+            self.last_battery = battery
             self._publish_to_zenoh(self.battery_pub, battery)
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
         except RpcError as e:
-            self._log_error('RPC', method_name, e)
+            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+                self.logger.warning(f'Timeout in {method_name}, publishing cached value')
+                self._publish_to_zenoh(self.battery_pub, self.last_battery)
+            else:
+                self._log_error('RPC', method_name, e)
+                self._publish_to_zenoh(self.battery_pub, self.last_battery)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
     async def publish_map_name(self) -> None:
         """Publish the current map name to Zenoh.
 
-        Gets the current map ID from Kachaka, looks up the map name
-        from the map list, applies any name mapping defined in the configuration,
-        and publishes the map name to Zenoh.
-
-        Uses the reverse_map_name_mapping to convert Kachaka's internal map names
-        (e.g., 'L27') to more descriptive names (e.g., '27F').
-
-        Handles connection errors and unexpected response formats.
-
-        Raises:
-            Does not raise exceptions as they are caught and logged internally.
+        Gets the current map ID from Kachaka via gRPC stub with timeout,
+        looks up the map name, applies name mapping, and publishes to Zenoh.
+        On timeout, publishes cached value to keep the telemetry loop running.
         """
         method_name = 'publish_map_name'
         try:
-            map_list = await self.run_method('get_map_list')
-            search_id = await self.run_method('get_current_map_id')
+            map_list_response = self.kachaka_client.stub.GetMapList(pb2.GetRequest(),
+                                                                    timeout=self.grpc_telemetry_timeout)
+            map_id_response = self.kachaka_client.stub.GetCurrentMapId(pb2.GetRequest(),
+                                                                       timeout=self.grpc_telemetry_timeout)
 
-            kachaka_map_name = next((item['name'] for item in map_list if item['id'] == search_id), 'L1')
+            search_id = map_id_response.id
+            kachaka_map_name = next(
+                (entry.name for entry in map_list_response.map_list_entries if entry.id == search_id), 'L1')
             map_name = self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
             self.map_name = map_name
 
             self._publish_to_zenoh(self.map_name_pub, map_name)
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
         except RpcError as e:
-            self._log_error('RPC', method_name, e)
+            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+                self.logger.warning(f'Timeout in {method_name}, publishing cached value')
+            else:
+                self._log_error('RPC', method_name, e)
+            self._publish_to_zenoh(self.map_name_pub, self.map_name)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
@@ -525,10 +511,13 @@ class KachakaApiClientByZenoh:
                         result['is_completed']):
                     self._reset_async_command_state()
 
-        except ConnectionError as e:
-            self._log_error('Connection', method_name, e)
         except RpcError as e:
-            self._log_error('RPC', method_name, e)
+            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+                self.logger.warning(f'Timeout in {method_name}, publishing cached value')
+            else:
+                self._log_error('RPC', method_name, e)
+            if self.last_command_result:
+                self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
@@ -1041,14 +1030,29 @@ def main() -> None:
             command_thread.start()
 
             while True:
-                try:
-                    asyncio.run(node.publish_pose())
-                    asyncio.run(node.publish_battery())
-                    asyncio.run(node.publish_map_name())
-                    asyncio.run(node.publish_result())
-                    consecutive_errors = 0  # Reset on success
-                except (ConnectionError, RpcError, Exception) as e:
-                    consecutive_errors = _handle_main_loop_error(node, e, consecutive_errors, max_consecutive_errors)
+                publish_fns = [
+                    node.publish_pose,
+                    node.publish_battery,
+                    node.publish_map_name,
+                    node.publish_result,
+                ]
+                any_success = False
+                for publish_fn in publish_fns:
+                    try:
+                        asyncio.run(publish_fn())
+                        any_success = True
+                    except Exception as e:
+                        node.logger.error(f'Error in {publish_fn.__name__}: {e}')
+
+                if any_success:
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        msg = f'Too many consecutive full failures ({consecutive_errors}), exiting'
+                        node.logger.error(msg)
+                        print(msg)
+                        raise RuntimeError(msg)
 
                 time.sleep(sleep_time)
 

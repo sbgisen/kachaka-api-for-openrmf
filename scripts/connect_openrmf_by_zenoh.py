@@ -64,6 +64,7 @@ class KachakaApiClientByZenoh:
     current_command_id: Optional[str]
     is_async_command: bool
     saw_running: bool
+    async_command_started_at: Optional[float]
     command_check_interval: float
     logger: logging.Logger
     retry_enabled: bool
@@ -164,6 +165,7 @@ class KachakaApiClientByZenoh:
         self.current_command_id = None
         self.is_async_command = False
         self.saw_running = False
+        self.async_command_started_at = None
         self.retry_count = 0
         self._command_lock = threading.RLock()
 
@@ -289,6 +291,12 @@ class KachakaApiClientByZenoh:
             self.logger.debug(f'Captured command_id {command_id} for {method_name}')
         else:
             self.logger.warning(f'Async command {method_name} did not return commandId; awaiting state update')
+
+    def _running_state_wait_expired(self) -> bool:
+        """Return True when waiting for RUNNING has exceeded the configured timeout."""
+        if self.async_command_started_at is None:
+            return False
+        return (time.monotonic() - self.async_command_started_at) >= self.running_state_wait
 
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
@@ -456,8 +464,14 @@ class KachakaApiClientByZenoh:
                     return
 
                 if self.is_async_command and not self.saw_running:
-                    self.logger.debug('Async command: waiting to see RUNNING state first')
-                    return
+                    if self.current_command_id is None and command_id and self._running_state_wait_expired():
+                        self.current_command_id = command_id
+                        self._log_warning(
+                            f'RUNNING state was not observed within {self.running_state_wait}s; '
+                            f'falling back to command_id={command_id} for task {self.task_id}')
+                    elif self.current_command_id is None:
+                        self.logger.debug('Async command: waiting to see RUNNING state first')
+                        return
 
                 last_result = self._get_last_command_result_response()
                 self.logger.debug(f'GetLastCommandResult response: {last_result}')
@@ -661,6 +675,15 @@ class KachakaApiClientByZenoh:
         self.is_async_command = not prepared.get('wait_for_completion', True)
         return prepared
 
+    def _complete_superseded_task(self, new_task_id: Optional[str]) -> None:
+        """Mark the current active task as superseded before accepting a new one."""
+        if not self.task_id or self.task_id == new_task_id:
+            return
+
+        self._log_warning(f'Superseding active task {self.task_id} with new task {new_task_id}')
+        # error_code=-3: task was replaced by a newer command before completion.
+        self._publish_command_completion(success=False, error_code=-3)
+
     def _execute_command(self, command: Dict[str, Any]) -> None:
         """Unified command execution logic."""
         method_name = 'execute_command'
@@ -669,9 +692,11 @@ class KachakaApiClientByZenoh:
                 if not all(k in command for k in ('method', 'args')):
                     raise ValueError('Invalid command structure')
 
+                new_task_id = command.get('id', None)
+                self._complete_superseded_task(new_task_id)
                 method_name = command['method']
                 method_name = self.method_mapping.get(method_name, method_name)
-                self.task_id = command.get('id', None)
+                self.task_id = new_task_id
 
                 if not hasattr(self.kachaka_client, method_name):
                     raise AttributeError(f'Invalid method: {method_name}')
@@ -680,6 +705,9 @@ class KachakaApiClientByZenoh:
                 self.last_command = command
                 self.last_command_result = None
                 self.current_command_id = None
+                self.is_async_command = False
+                self.saw_running = False
+                self.async_command_started_at = None
                 self.retry_count = 0
 
                 # Execute the command
@@ -792,6 +820,7 @@ class KachakaApiClientByZenoh:
                 if self.is_async_command and success:
                     # Async command started, don't publish completion yet
                     # publish_result will handle completion after RUNNING state is seen
+                    self.async_command_started_at = time.monotonic()
                     self.logger.info(f'Async command {method_name} started')
                 elif success:
                     self.logger.info(f'Command {method_name} completed successfully')
@@ -829,8 +858,9 @@ class KachakaApiClientByZenoh:
         self.is_async_command = False
         self.saw_running = False
         self.current_command_id = None
+        self.async_command_started_at = None
 
-    def _publish_command_completion(self, success: bool, error_code: int) -> None:
+    def _publish_command_completion(self, success: bool, error_code: int) -> bool:
         """Publish command completion status to Zenoh.
 
         Args:
@@ -838,16 +868,19 @@ class KachakaApiClientByZenoh:
             error_code (int): The error code (0 if success)
         """
         if not self.task_id:
-            return
+            return False
 
         completion_result = {'id': self.task_id, 'is_completed': True, 'success': success, 'error_code': error_code}
 
         self.last_command_result = completion_result
         self.logger.debug(f'Publishing command completion: {completion_result}')
-        self._publish_to_zenoh(self.command_is_completed_pub, completion_result)
+        if not self._publish_to_zenoh(self.command_is_completed_pub, completion_result):
+            self._log_warning(f'Failed to publish completion for task {self.task_id}; keeping state for retry')
+            return False
 
         # Clear all async command tracking state after publishing
         self._reset_async_command_state()
+        return True
 
     def grpc_connection_check(self, max_retries: Optional[int] = None) -> bool:
         """Check if the gRPC connection to Kachaka API server is alive.

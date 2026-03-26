@@ -78,19 +78,19 @@ class CommandCompletion:
 @dataclass(frozen=True)
 class MapState:
     telemetry_map_name: str
-    command_context_map_name: str
+    command_context_map_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.telemetry_map_name:
             raise ValueError('telemetry_map_name must not be empty')
-        if not self.command_context_map_name:
-            raise ValueError('command_context_map_name must not be empty')
 
     @classmethod
-    def initial(cls, map_name: str = 'L1') -> 'MapState':
-        return cls(telemetry_map_name=map_name, command_context_map_name=map_name)
+    def initial(cls) -> 'MapState':
+        return cls(telemetry_map_name='unknown', command_context_map_name=None)
 
     def with_telemetry_map_name(self, map_name: str) -> 'MapState':
+        if self.command_context_map_name is None:
+            return MapState(telemetry_map_name=map_name, command_context_map_name=map_name)
         return MapState(telemetry_map_name=map_name, command_context_map_name=self.command_context_map_name)
 
     def with_map_name(self, map_name: str) -> 'MapState':
@@ -792,7 +792,11 @@ class KachakaApiClientByZenoh:
                 elif method_name == 'move_to_pose':
                     args = command['args'].copy()
                     map_name = args.pop('map_name', None)
-                    if map_name is not None and map_name != self.map_state.command_context_map_name:
+                    if (
+                        map_name is not None
+                        and self.map_state.command_context_map_name is not None
+                        and map_name != self.map_state.command_context_map_name
+                    ):
                         # Map name mismatch indicates RMF has incorrect floor information.
                         # Reject the navigation command and return error to trigger replanning.
                         self._log_warning(

@@ -123,15 +123,10 @@ def publish_command_via_queryable(zenoh_router: str, robot_name: str, command: D
                 result = json.loads(sample.payload.to_string())
                 result_id = result.get('id', 'unknown')
                 is_completed = result.get('is_completed', False)
-                success = result.get('success')
-                error_code = result.get('error_code')
 
                 if result_id == command_id:
                     if is_completed:
-                        if success:
-                            print(f'✅ Command completed successfully! (id: {result_id})')
-                        else:
-                            print(f'❌ Command failed! (id: {result_id}, error_code: {error_code})')
+                        print(f'✅ Command completed! (id: {result_id})')
                     else:
                         print(f'⏳ Command in progress... (id: {result_id})')
                 else:

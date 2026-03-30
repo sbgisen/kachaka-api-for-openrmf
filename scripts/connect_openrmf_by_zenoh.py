@@ -78,7 +78,6 @@ class CommandCompletion:
 @dataclass(frozen=True)
 class MapState:
     telemetry_map_name: str
-    command_context_map_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.telemetry_map_name:
@@ -86,15 +85,10 @@ class MapState:
 
     @classmethod
     def initial(cls) -> 'MapState':
-        return cls(telemetry_map_name='unknown', command_context_map_name=None)
+        return cls(telemetry_map_name='unknown')
 
     def with_telemetry_map_name(self, map_name: str) -> 'MapState':
-        if self.command_context_map_name is None:
-            return MapState(telemetry_map_name=map_name, command_context_map_name=map_name)
-        return MapState(telemetry_map_name=map_name, command_context_map_name=self.command_context_map_name)
-
-    def with_map_name(self, map_name: str) -> 'MapState':
-        return MapState(telemetry_map_name=map_name, command_context_map_name=map_name)
+        return MapState(telemetry_map_name=map_name)
 
 
 class KachakaApiClientByZenoh:
@@ -228,6 +222,7 @@ class KachakaApiClientByZenoh:
         self.last_pose = Pose.zero()
         self.last_battery = 100.0
         self.map_state = MapState.initial()
+        self._command_context_map_name: Optional[str] = None
         self.last_command = None
         self.last_command_result = None
         self.last_command_id = None
@@ -438,6 +433,9 @@ class KachakaApiClientByZenoh:
             )
             map_name = self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
             self.map_state = self.map_state.with_telemetry_map_name(map_name)
+            with self._command_lock:
+                if self._command_context_map_name is None:
+                    self._command_context_map_name = map_name
 
             self._publish_to_zenoh(self.map_name_pub, map_name)
         except RpcError as e:
@@ -794,14 +792,14 @@ class KachakaApiClientByZenoh:
                     map_name = args.pop('map_name', None)
                     if (
                         map_name is not None
-                        and self.map_state.command_context_map_name is not None
-                        and map_name != self.map_state.command_context_map_name
+                        and self._command_context_map_name is not None
+                        and map_name != self._command_context_map_name
                     ):
                         # Map name mismatch indicates RMF has incorrect floor information.
                         # Reject the navigation command and return error to trigger replanning.
                         self._log_warning(
                             f'Map name mismatch: requested={map_name}, '
-                            f'current={self.map_state.command_context_map_name}. '
+                            f'current={self._command_context_map_name}. '
                             f'Rejecting navigation command to prevent navigation to wrong floor coordinates.'
                         )
                         self._publish_command_completion(success=False, error_code=-2)
@@ -855,19 +853,22 @@ class KachakaApiClientByZenoh:
             # switch map only if the map is different from the current map id
             # because switch_map method takes long time to complete
             if map_id == current_map_id:
-                self.map_state = self.map_state.with_map_name(args.get('map_name'))
+                self._command_context_map_name = args.get('map_name')
                 self.logger.info('Nothing to do - already on target map')
                 self._publish_command_completion(success=True, error_code=0)
             else:
                 response = self._execute_sync_method('switch_map', payload)
-                # Success/failure logging and notification handled by _execute_sync_method
-                # Update map_name immediately after successful switch_map
-                if response and isinstance(response, dict) and response.get('result', {}).get('success', False):
-                    self.map_state = self.map_state.with_map_name(args.get('map_name'))
+                # Update command context if switch_map did not raise an exception.
+                # Note: switch_map response may lack 'result' field, so we check
+                # both formats: with result.success and without result (assume success).
+                success = True
+                if response and isinstance(response, dict) and 'result' in response:
+                    success = response['result'].get('success', False)
+                if success:
+                    self._command_context_map_name = args.get('map_name')
                     self.logger.info(
-                        'Updated map state after successful switch_map: telemetry=%s command_context=%s',
-                        self.map_state.telemetry_map_name,
-                        self.map_state.command_context_map_name,
+                        'Updated command_context_map_name after successful switch_map: %s',
+                        self._command_context_map_name,
                     )
         except RpcError as e:
             self._log_error('RPC', method_name, e)

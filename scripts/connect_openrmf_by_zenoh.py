@@ -432,7 +432,11 @@ class KachakaApiClientByZenoh:
                     # Keep publishing last result for Pub/Sub reliability.
                     # Fleet adapter's ID check ensures stale completions are ignored.
                     if self.last_command_result:
-                        self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
+                        completion_payload = {
+                            'id': self.last_command_result['id'],
+                            'is_completed': self.last_command_result['is_completed'],
+                        }
+                        self._publish_to_zenoh(self.command_is_completed_pub, completion_payload)
                     return
 
                 state_res = self._get_command_state_response()
@@ -460,15 +464,15 @@ class KachakaApiClientByZenoh:
                     self.saw_running = True
                     result = {'id': self.task_id, 'is_completed': False, 'success': None, 'error_code': None}
                     self.last_command_result = result
-                    self._publish_to_zenoh(self.command_is_completed_pub, result)
+                    completion_payload = {'id': self.task_id, 'is_completed': False}
+                    self._publish_to_zenoh(self.command_is_completed_pub, completion_payload)
                     return
 
                 if self.is_async_command and not self.saw_running:
                     if self.current_command_id is None and command_id and self._running_state_wait_expired():
                         self.current_command_id = command_id
-                        self._log_warning(
-                            f'RUNNING state was not observed within {self.running_state_wait}s; '
-                            f'falling back to command_id={command_id} for task {self.task_id}')
+                        self._log_warning(f'RUNNING state was not observed within {self.running_state_wait}s; '
+                                          f'falling back to command_id={command_id} for task {self.task_id}')
                     elif self.current_command_id is None:
                         self.logger.debug('Async command: waiting to see RUNNING state first')
                         return
@@ -516,7 +520,9 @@ class KachakaApiClientByZenoh:
 
                 # Publish and reset
                 self.last_command_result = result
-                if self._publish_to_zenoh(self.command_is_completed_pub, result) and result['is_completed']:
+                completion_payload = {'id': result['id'], 'is_completed': result['is_completed']}
+                if (self._publish_to_zenoh(self.command_is_completed_pub, completion_payload) and
+                        result['is_completed']):
                     self._reset_async_command_state()
 
         except ConnectionError as e:
@@ -874,7 +880,9 @@ class KachakaApiClientByZenoh:
 
         self.last_command_result = completion_result
         self.logger.debug(f'Publishing command completion: {completion_result}')
-        if not self._publish_to_zenoh(self.command_is_completed_pub, completion_result):
+        # Only publish id and is_completed to Zenoh; success/error_code are internal state
+        completion_payload = {'id': self.task_id, 'is_completed': True}
+        if not self._publish_to_zenoh(self.command_is_completed_pub, completion_payload):
             self._log_warning(f'Failed to publish completion for task {self.task_id}; keeping state for retry')
             return False
 
@@ -924,7 +932,11 @@ class KachakaApiClientByZenoh:
                 self._publish_to_zenoh(self.battery_pub, self.last_battery)
                 self._publish_to_zenoh(self.map_name_pub, self.map_name)
                 if self.last_command_result:
-                    self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result)
+                    completion_payload = {
+                        'id': self.last_command_result['id'],
+                        'is_completed': self.last_command_result['is_completed'],
+                    }
+                    self._publish_to_zenoh(self.command_is_completed_pub, completion_payload)
                 if e.code() == StatusCode.UNAVAILABLE:
                     self._log_error_msg(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
                     time.sleep(sleep_time)

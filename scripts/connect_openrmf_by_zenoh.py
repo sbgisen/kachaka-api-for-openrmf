@@ -699,6 +699,7 @@ class KachakaApiClientByZenoh:
                     raise ValueError('Invalid command structure')
 
                 new_task_id = command.get('id', None)
+                is_retry = new_task_id is not None and new_task_id == self.task_id
                 self._complete_superseded_task(new_task_id)
                 method_name = command['method']
                 method_name = self.method_mapping.get(method_name, method_name)
@@ -714,7 +715,8 @@ class KachakaApiClientByZenoh:
                 self.is_async_command = False
                 self.saw_running = False
                 self.async_command_started_at = None
-                self.retry_count = 0
+                if not is_retry:
+                    self.retry_count = 0
 
                 # Execute the command
                 if method_name == 'switch_map':

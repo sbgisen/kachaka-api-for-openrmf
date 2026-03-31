@@ -839,8 +839,9 @@ class KachakaApiClientByZenoh:
                     # Always publish failure immediately
                     self._publish_command_completion(success=False, error_code=error_code)
             else:
-                # No result field (e.g., query methods), assume success
+                # No result field (e.g., switch_map), assume success
                 self.logger.info(f'Command {method_name} executed successfully')
+                self._publish_command_completion(success=True, error_code=0)
 
             return response
 

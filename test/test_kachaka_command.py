@@ -27,13 +27,10 @@ from typing import Any, Dict, Optional
 import zenoh
 
 
-def create_switch_map_command(robot_name: str,
-                              map_name: str,
-                              pose: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+def create_switch_map_command(map_name: str, pose: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     """Create a switch_map command.
 
     Args:
-        robot_name: Name of the robot
         map_name: Name of the map to switch to
         pose: Optional pose with x, y, theta. Defaults to origin.
 
@@ -53,15 +50,10 @@ def create_switch_map_command(robot_name: str,
     }
 
 
-def create_move_to_pose_command(robot_name: str,
-                                x: float,
-                                y: float,
-                                yaw: float,
-                                map_name: Optional[str] = None) -> Dict[str, Any]:
+def create_move_to_pose_command(x: float, y: float, yaw: float, map_name: Optional[str] = None) -> Dict[str, Any]:
     """Create a move_to_pose command.
 
     Args:
-        robot_name: Name of the robot
         x: Target x coordinate
         y: Target y coordinate
         yaw: Target orientation in radians
@@ -78,11 +70,8 @@ def create_move_to_pose_command(robot_name: str,
     return {'id': f'test_move_to_pose_{int(time.time())}', 'method': 'move_to_pose', 'args': args}
 
 
-def create_dock_command(robot_name: str) -> Dict[str, Any]:
+def create_dock_command() -> Dict[str, Any]:
     """Create a dock command.
-
-    Args:
-        robot_name: Name of the robot
 
     Returns:
         Command dictionary
@@ -203,7 +192,7 @@ def main() -> None:
                 pose = {'x': float(sys.argv[5]), 'y': float(sys.argv[6]), 'theta': float(sys.argv[7])}
                 print(f'Using custom pose: {pose}')
 
-            command = create_switch_map_command(robot_name, map_name, pose)
+            command = create_switch_map_command(map_name, pose)
 
         elif command_type == 'move_to_pose':
             if len(sys.argv) < 7:
@@ -216,10 +205,10 @@ def main() -> None:
             yaw = float(sys.argv[6])
             map_name = sys.argv[7] if len(sys.argv) > 7 else None
 
-            command = create_move_to_pose_command(robot_name, x, y, yaw, map_name)
+            command = create_move_to_pose_command(x, y, yaw, map_name)
 
         elif command_type == 'dock':
-            command = create_dock_command(robot_name)
+            command = create_dock_command()
 
         else:
             print(f'❌ Unknown command: {command_type}')

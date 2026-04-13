@@ -854,19 +854,27 @@ class KachakaApiClientByZenoh:
                 self.logger.info('Nothing to do - already on target map')
                 self._publish_command_completion(success=True, error_code=0)
             else:
-                response = self._execute_sync_method('switch_map', payload)
-                # Update command context if switch_map did not raise an exception.
-                # Note: switch_map response may lack 'result' field, so we check
-                # both formats: with result.success and without result (assume success).
+                # Suppress automatic completion in _execute_sync_method so we can
+                # publish map_name to Zenoh *before* notifying RMF of completion.
+                # This prevents a race where RMF receives the completion, queries
+                # the robot's map_name (still the old floor), and issues a
+                # navigation command with stale floor coordinates.
+                response = self._execute_sync_method('switch_map', payload, publish_completion=False)
                 success = True
                 if response and isinstance(response, dict) and 'result' in response:
                     success = response['result'].get('success', False)
                 if success:
-                    self._command_context_map_name = args.get('map_name')
+                    rmf_map_name = args.get('map_name')
+                    self._command_context_map_name = rmf_map_name
+                    self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
+                    self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
                     self.logger.info(
-                        'Updated command_context_map_name after successful switch_map: %s',
-                        self._command_context_map_name,
+                        'Published map_name=%s to Zenoh after successful switch_map',
+                        rmf_map_name,
                     )
+                    self._publish_command_completion(success=True, error_code=0)
+                else:
+                    self._publish_command_completion(success=False, error_code=-1)
         except RpcError as e:
             self._log_error('RPC', method_name, e)
             self._publish_command_completion(success=False, error_code=-1)
@@ -874,12 +882,20 @@ class KachakaApiClientByZenoh:
             self._log_error('Unexpected', method_name, e)
             self._publish_command_completion(success=False, error_code=-1)
 
-    def _execute_sync_method(self, method_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a method synchronously and publish completion status.
+    def _execute_sync_method(
+        self,
+        method_name: str,
+        args: Dict[str, Any],
+        publish_completion: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute a method synchronously and optionally publish completion status.
 
         Args:
             method_name (str): The name of the method to execute
             args (Dict[str, Any]): The arguments for the method
+            publish_completion (bool): Whether to automatically publish completion
+                status. Set to False when the caller needs to perform additional
+                state updates (e.g., publishing map_name) before notifying RMF.
 
         Returns:
             Dict[str, Any]: The response from the method
@@ -888,7 +904,7 @@ class KachakaApiClientByZenoh:
             if not self.grpc_connection_check():
                 error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
                 self.logger.error(error_msg)
-                if self.task_id:
+                if self.task_id and publish_completion:
                     self._publish_command_completion(success=False, error_code=-1)
                 raise ConnectionError(error_msg)
 
@@ -909,16 +925,17 @@ class KachakaApiClientByZenoh:
                     self.logger.info(f'Async command {method_name} started')
                 elif success:
                     self.logger.info(f'Command {method_name} completed successfully')
-                    # Synchronous command completed successfully
-                    self._publish_command_completion(success=True, error_code=0)
+                    if publish_completion:
+                        self._publish_command_completion(success=True, error_code=0)
                 else:
                     self._log_warning(f'Command {method_name} failed with error_code={error_code}')
-                    # Always publish failure immediately
-                    self._publish_command_completion(success=False, error_code=error_code)
+                    if publish_completion:
+                        self._publish_command_completion(success=False, error_code=error_code)
             else:
                 # No result field (e.g., switch_map), assume success
                 self.logger.info(f'Command {method_name} executed successfully')
-                self._publish_command_completion(success=True, error_code=0)
+                if publish_completion:
+                    self._publish_command_completion(success=True, error_code=0)
 
             return response
 

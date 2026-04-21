@@ -439,33 +439,46 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
-    async def _handle_command_retry(self, error_code: int) -> bool:
+    async def _handle_command_retry(self, task_id: str, error_code: int) -> bool:
         """Handle retry logic for failed commands.
 
         Args:
+            task_id: The task ID that produced the failed result
             error_code: The error code from the failed command
 
         Returns:
             True if retry was initiated (caller should return early), False otherwise
         """
-        if not self.retry_enabled or self.retry_count >= self.max_navigation_retries:
-            if self.retry_count >= self.max_navigation_retries:
-                self._log_error_msg(f'Max retries ({self.max_navigation_retries}) exceeded for command {self.task_id}')
-            return False
-
         should_retry = await self._should_retry_command(error_code)
         if not should_retry:
             self._log_info(f'Error code {error_code} is not retriable')
             return False
 
-        self.retry_count += 1
-        self._log_info(f'Retrying command (attempt {self.retry_count}/{self.max_navigation_retries})')
+        with self._command_lock:
+            if self.task_id != task_id:
+                self.logger.debug('Skip retry for stale task %s (active task: %s)', task_id, self.task_id)
+                return False
+            if not self.retry_enabled or self.retry_count >= self.max_navigation_retries:
+                if self.retry_count >= self.max_navigation_retries:
+                    self._log_error_msg(f'Max retries ({self.max_navigation_retries}) exceeded for command {task_id}')
+                return False
+            if not self.last_command:
+                return False
+
+            self.retry_count += 1
+            retry_count = self.retry_count
+            command_to_retry = self.last_command.copy()
+
+        self._log_info(f'Retrying command (attempt {retry_count}/{self.max_navigation_retries})')
 
         await asyncio.sleep(self.retry_interval)
-        if self.last_command:
-            self._execute_command(self.last_command)
-            return True
-        return False
+        with self._command_lock:
+            if self.task_id != task_id:
+                self.logger.debug('Cancel retry for stale task %s (active task: %s)', task_id, self.task_id)
+                return False
+
+        self._execute_command(command_to_retry)
+        return True
 
     async def publish_result(self) -> None:
         """Publish command completion status to Zenoh.
@@ -474,6 +487,8 @@ class KachakaApiClientByZenoh:
         Uses command_id to ensure state/result pairs belong to the active command.
         """
         method_name = 'publish_result'
+        retry_task_id: Optional[str] = None
+        retry_error_code: Optional[int] = None
         try:
             with self._command_lock:
                 if not self.task_id:
@@ -574,8 +589,16 @@ class KachakaApiClientByZenoh:
                         self.retry_count = 0
                     else:
                         self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
-                        if await self._handle_command_retry(error_code):
-                            return  # Retry initiated, don't publish yet
+                        retry_task_id = self.task_id
+                        retry_error_code = error_code
+
+            if retry_task_id is not None and retry_error_code is not None:
+                if await self._handle_command_retry(retry_task_id, retry_error_code):
+                    return  # Retry initiated, don't publish yet
+
+            with self._command_lock:
+                if retry_task_id is not None and self.task_id != retry_task_id:
+                    return
 
                 # Publish and reset
                 self.last_command_result = result

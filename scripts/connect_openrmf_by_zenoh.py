@@ -873,7 +873,10 @@ class KachakaApiClientByZenoh:
             # switch map only if the map is different from the current map id
             # because switch_map method takes long time to complete
             if map_id == current_map_id:
-                self._command_context_map_name = args.get('map_name')
+                rmf_map_name = args.get('map_name')
+                self._command_context_map_name = rmf_map_name
+                self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
+                self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
                 self.logger.info('Nothing to do - already on target map')
                 self._publish_command_completion(success=True, error_code=0)
             else:

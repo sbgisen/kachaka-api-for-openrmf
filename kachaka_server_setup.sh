@@ -56,7 +56,9 @@ fi
 ${RUN_ZENOH:+python3 sbgisen/connect_openrmf_by_zenoh.py &}
 # Exit when any child process dies so the supervisor can restart the whole stack
 # (matches the original foreground-bridge behaviour where bridge death exited the script).
-trap 'kill 0' EXIT
+# Use jobs -p to limit the cleanup to processes this script started; kill 0 would
+# also signal the parent shell or unrelated members of the same process group.
+trap 'jobs -p | xargs -r kill 2>/dev/null' EXIT
 wait -n
 EOF
 

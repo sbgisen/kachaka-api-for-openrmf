@@ -17,6 +17,7 @@ timeouts:
   running_state_wait: 5.0   # Max wait time for RUNNING state after command sent
   grpc_telemetry: 5.0       # Timeout for telemetry gRPC calls (get_robot_pose, etc.)
   grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
+  grpc_stuck: 30.0          # Threshold (sec) for treating persistent Deadline Exceeded as a stuck channel
 
 intervals:
   command_check: 4.0        # How often to check for new commands

@@ -30,8 +30,8 @@ from google._upb._message import RepeatedCompositeContainer
 from google.protobuf.json_format import MessageToDict
 from grpc import RpcError
 from grpc import StatusCode
-import kachaka_api
 from kachaka_api.generated import kachaka_api_pb2 as pb2
+from kachaka_client_with_keepalive import KachakaApiClientWithKeepalive
 import yaml
 import zenoh
 
@@ -52,6 +52,18 @@ class Pose:
 
 @dataclass(frozen=True)
 class CommandCompletion:
+    """Internal command completion state.
+
+    error_code values used internally:
+        0   : success
+        -1  : unknown / format error
+        -2  : map name mismatch
+        -3  : superseded by a new command
+        -4  : gRPC channel persistently stuck (Deadline Exceeded > grpc_stuck threshold)
+
+    Negative error_codes are internal signals to RMF for replan; not retriable on Kachaka side.
+    """
+
     task_id: str
     is_completed: bool
     success: Optional[bool]
@@ -172,6 +184,7 @@ class KachakaApiClientByZenoh:
         self.running_state_wait = timeouts.get('running_state_wait', 5.0)
         self.grpc_telemetry_timeout = timeouts.get('grpc_telemetry', 5.0)
         self.grpc_status_check_timeout = timeouts.get('grpc_status_check', 5.0)
+        self.grpc_stuck_threshold = float(timeouts.get('grpc_stuck', 30.0))
         self.command_check_interval = intervals.get('command_check', 4.0)
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
@@ -182,8 +195,9 @@ class KachakaApiClientByZenoh:
         self.max_navigation_retries = navigation_retry.get('max_retries', 3)
         self.retry_interval = navigation_retry.get('retry_interval', 2.0)
         self.retry_on_error_types = navigation_retry.get('retry_on_error_types', ['Error'])
-        self.kachaka_client = (kachaka_api.KachakaApiClient(kachaka_access_point)
-                               if kachaka_access_point else kachaka_api.KachakaApiClient())
+        self.kachaka_access_point = kachaka_access_point
+        self.kachaka_client = (KachakaApiClientWithKeepalive(kachaka_access_point)
+                               if kachaka_access_point else KachakaApiClientWithKeepalive())
         self.robot_name = robot_name
         self.task_id = None
         logging.basicConfig(
@@ -227,6 +241,8 @@ class KachakaApiClientByZenoh:
         self.async_command_started_at = None
         self.retry_count = 0
         self._command_lock = threading.RLock()
+        self._client_lock = threading.RLock()
+        self._first_grpc_failure_time: Optional[float] = None
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -487,6 +503,7 @@ class KachakaApiClientByZenoh:
                     return
 
                 state_res = self._get_command_state_response()
+                self._first_grpc_failure_time = None
                 self.logger.debug(f'GetCommandState response: {state_res}')
                 command_id = state_res.get('commandId')
                 state_value = state_res.get('state')
@@ -583,12 +600,47 @@ class KachakaApiClientByZenoh:
                     self._reset_async_command_state()
 
         except RpcError as e:
-            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+            code = e.code()
+            is_deadline = code == StatusCode.DEADLINE_EXCEEDED
+            is_unavailable = code == StatusCode.UNAVAILABLE
+            if is_deadline:
                 self.logger.warning(f'Timeout in {method_name}, publishing cached value')
+            elif is_unavailable:
+                self.logger.warning(f'UNAVAILABLE in {method_name}, will reconstruct client')
             else:
                 self._log_error('RPC', method_name, e)
-            if self.last_command_result:
-                self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result.as_payload())
+
+            fail_recovery_needed = False
+            immediate_reconnect_needed = False
+            with self._command_lock:
+                if is_unavailable:
+                    immediate_reconnect_needed = True
+                    self._first_grpc_failure_time = None
+                elif is_deadline and self.task_id:
+                    now = time.monotonic()
+                    if self._first_grpc_failure_time is None:
+                        self._first_grpc_failure_time = now
+                    elif now - self._first_grpc_failure_time >= self.grpc_stuck_threshold:
+                        stuck_task = self.task_id
+                        self._log_error_msg(f'gRPC stuck for {self.grpc_stuck_threshold}s on task {stuck_task}; '
+                                            f'publishing failure (error_code=-4) and reconstructing client')
+                        fail_result = CommandCompletion(
+                            task_id=stuck_task,
+                            is_completed=True,
+                            success=False,
+                            error_code=-4,
+                        )
+                        self.last_command_result = fail_result
+                        self._publish_to_zenoh(self.command_is_completed_pub, fail_result.as_payload())
+                        self._reset_async_command_state()
+                        self._first_grpc_failure_time = None
+                        fail_recovery_needed = True
+
+                if not (fail_recovery_needed or immediate_reconnect_needed) and self.last_command_result:
+                    self._publish_to_zenoh(self.command_is_completed_pub, self.last_command_result.as_payload())
+
+            if fail_recovery_needed or immediate_reconnect_needed:
+                self._reconstruct_kachaka_client()
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
@@ -601,6 +653,10 @@ class KachakaApiClientByZenoh:
         Returns:
             bool: True if the command should be retried, False otherwise
         """
+        # Negative error codes are internal signals to RMF (replan); never retry on Kachaka side.
+        if error_code < 0:
+            self.logger.info(f'Internal error code {error_code}; not retriable on Kachaka side')
+            return False
         try:
             # error_code=0 with success=False typically means the navigation was cancelled
             # (e.g., due to temporary obstacles from LiDAR noise). This should be retried.
@@ -945,6 +1001,31 @@ class KachakaApiClientByZenoh:
         self.saw_running = False
         self.current_command_id = None
         self.async_command_started_at = None
+
+    def _reconstruct_kachaka_client(self) -> bool:
+        """Recreate the KachakaApiClient to recover from a dead gRPC channel.
+
+        Closes the old channel explicitly before creating a new one to
+        release resources promptly. In-flight RPCs hold the old client
+        through their local references, so swapping the attribute is safe.
+        """
+        with self._client_lock:
+            old_client = self.kachaka_client
+            try:
+                self._log_info('Reconstructing KachakaApiClient to recover gRPC channel')
+                new_client = (KachakaApiClientWithKeepalive(self.kachaka_access_point)
+                              if self.kachaka_access_point else KachakaApiClientWithKeepalive())
+                self.kachaka_client = new_client
+                self._log_info('KachakaApiClient reconstructed successfully')
+                try:
+                    if hasattr(old_client, 'close'):
+                        old_client.close()
+                except Exception as ce:
+                    self.logger.warning(f'Failed to close old client channel: {ce}')
+                return True
+            except Exception as e:
+                self._log_error('Unexpected', '_reconstruct_kachaka_client', e)
+                return False
 
     def _publish_command_completion(self, success: bool, error_code: int) -> bool:
         """Publish command completion status to Zenoh.

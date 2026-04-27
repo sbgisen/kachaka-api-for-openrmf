@@ -54,7 +54,10 @@ if [ "\${DISABLE_REST_API:-0}" != "1" ]; then
   uvicorn sbgisen.rest_kachaka_api:app --host 0.0.0.0 --port 26502 &
 fi
 ${RUN_ZENOH:+python3 sbgisen/connect_openrmf_by_zenoh.py &}
-wait
+# Exit when any child process dies so the supervisor can restart the whole stack
+# (matches the original foreground-bridge behaviour where bridge death exited the script).
+trap 'kill 0' EXIT
+wait -n
 EOF
 
 ssh -p $SSH_PORT kachaka@$KACHAKA_IP <<EOF

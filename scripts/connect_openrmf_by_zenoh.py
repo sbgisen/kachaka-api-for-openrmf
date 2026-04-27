@@ -54,14 +54,17 @@ class Pose:
 class CommandCompletion:
     """Internal command completion state.
 
-    error_code values used internally:
+    success and error_code are kept on the instance for the Kachaka-side retry
+    logic but are NOT published over Zenoh — see as_payload(). The signal that
+    actually reaches RMF is is_completed; flipping it to True for an active
+    task is what unblocks RMF from a stuck-running state.
+
+    error_code values used internally (not transmitted):
         0   : success
         -1  : unknown / format error
         -2  : map name mismatch
         -3  : superseded by a new command
         -4  : gRPC channel persistently stuck (Deadline Exceeded > grpc_stuck threshold)
-
-    Negative error_codes are internal signals to RMF for replan; not retriable on Kachaka side.
     """
 
     task_id: str
@@ -503,7 +506,6 @@ class KachakaApiClientByZenoh:
                     return
 
                 state_res = self._get_command_state_response()
-                self._first_grpc_failure_time = None
                 self.logger.debug(f'GetCommandState response: {state_res}')
                 command_id = state_res.get('commandId')
                 state_value = state_res.get('state')
@@ -549,6 +551,8 @@ class KachakaApiClientByZenoh:
                         return
 
                 last_result = self._get_last_command_result_response()
+                # Both GetCommandState and GetLastCommandResult succeeded; reset stuck timer.
+                self._first_grpc_failure_time = None
                 self.logger.debug(f'GetLastCommandResult response: {last_result}')
                 result_command_id = last_result.get('commandId')
 
@@ -622,8 +626,12 @@ class KachakaApiClientByZenoh:
                         self._first_grpc_failure_time = now
                     elif now - self._first_grpc_failure_time >= self.grpc_stuck_threshold:
                         stuck_task = self.task_id
-                        self._log_error_msg(f'gRPC stuck for {self.grpc_stuck_threshold}s on task {stuck_task}; '
-                                            f'publishing failure (error_code=-4) and reconstructing client')
+                        self._log_error_msg(
+                            f'gRPC stuck for {self.grpc_stuck_threshold}s on task {stuck_task}; '
+                            f'publishing is_completed=True (internal error_code=-4) and reconstructing client')
+                        # error_code=-4 is internal-only; CommandCompletion.as_payload() drops it.
+                        # The signal that reaches RMF is is_completed=True, which unblocks the
+                        # adapter from treating the task as still running.
                         fail_result = CommandCompletion(
                             task_id=stuck_task,
                             is_completed=True,

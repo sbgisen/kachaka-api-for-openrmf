@@ -54,10 +54,9 @@ class Pose:
 class CommandCompletion:
     """Internal command completion state.
 
-    success and error_code are kept on the instance for the Kachaka-side retry
-    logic but are NOT published over Zenoh — see as_payload(). The signal that
-    actually reaches RMF is is_completed; flipping it to True for an active
-    task is what unblocks RMF from a stuck-running state.
+    as_payload() publishes {id, is_completed, success} to Zenoh.
+    error_code is kept on the instance for the Kachaka-side retry logic
+    but is NOT published — see as_payload().
 
     error_code values used internally (not transmitted):
         0   : success
@@ -81,13 +80,15 @@ class CommandCompletion:
     def as_payload(self) -> Dict[str, Any]:
         """Return the payload for Zenoh publishing.
 
-        Only includes fields that consumers (fleet_adapter, lci_lift_request_converter) use.
-        success/error_code are internal state for retry logic and not published.
+        error_code is internal state for retry logic and not published.
         """
-        return {
+        payload: Dict[str, Any] = {
             'id': self.task_id,
             'is_completed': self.is_completed,
         }
+        if self.is_completed and self.success is not None:
+            payload['success'] = self.success
+        return payload
 
 
 @dataclass(frozen=True)

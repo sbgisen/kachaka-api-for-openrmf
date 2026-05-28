@@ -14,6 +14,9 @@ map_name_mapping:
 timeouts:
   command_query: 2.0        # Timeout for command queries
   grpc_connection: 5        # Wait time between gRPC connection retries
+  running_state_wait: 5.0   # Max wait time for RUNNING state after command sent
+  grpc_telemetry: 5.0       # Timeout for telemetry gRPC calls (get_robot_pose, etc.)
+  grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
 
 intervals:
   command_check: 4.0        # How often to check for new commands
@@ -23,6 +26,14 @@ intervals:
 connection:
   max_retries: 20           # Max gRPC connection retries
   max_consecutive_errors: 10  # Exit after this many consecutive errors
+
+# Navigation retry settings
+navigation_retry:
+  enabled: true             # Enable automatic retry on navigation failure
+  max_retries: 3            # Maximum number of retry attempts
+  retry_interval: 2.0       # Wait time (seconds) before retrying
+  retry_on_error_types:     # Error types that trigger automatic retry
+    - Error                 # Retriable errors (may succeed on retry)
 
 # Optional: Custom Zenoh config file path
 # zenoh_config: "/path/to/zenoh.json5"

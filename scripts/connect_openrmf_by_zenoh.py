@@ -984,11 +984,14 @@ class KachakaApiClientByZenoh:
 
         MessageToDict drops zero-valued fields, so a plain success serializes
         to {'success': True} and a failure with a non-zero code to
-        {'errorCode': N}. A Result with success=False and error_code=0
+        {'errorCode': N}. A bare Result with success=False and error_code=0
         therefore serializes to {} and is indistinguishable from a response
-        that carries no Result at all; both yield None (callers treat None as
-        success). This edge does not occur for the dispatch-time results
-        handled here, where failures always carry a non-zero error code.
+        that carries no Result at all; both yield None and callers treat None
+        as success. (The wrapped {'result': {...}} branch instead returns the
+        nested dict verbatim, so an empty {'result': {}} yields {} and is read
+        as success=False.) This ambiguous bare case does not occur for the
+        dispatch-time results handled here, where failures always carry a
+        non-zero error code.
         """
         if not isinstance(response, dict):
             return None

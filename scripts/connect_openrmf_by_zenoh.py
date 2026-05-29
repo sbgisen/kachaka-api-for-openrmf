@@ -951,9 +951,8 @@ class KachakaApiClientByZenoh:
                 # the robot's map_name (still the old floor), and issues a
                 # navigation command with stale floor coordinates.
                 response = self._execute_sync_method('switch_map', payload, publish_completion=False)
-                success = True
-                if response and isinstance(response, dict) and 'result' in response:
-                    success = response['result'].get('success', False)
+                result_dict = self._extract_command_result(response)
+                success = result_dict.get('success', False) if result_dict is not None else True
                 if success:
                     rmf_map_name = args.get('map_name')
                     self._command_context_map_name = rmf_map_name
@@ -972,6 +971,32 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
             self._publish_command_completion(success=False, error_code=-1)
+
+    @staticmethod
+    def _extract_command_result(response: Any) -> Optional[Dict[str, Any]]:  # noqa: ANN401
+        """Return the command Result dict from a method response, or None.
+
+        The kachaka high-level client's start_command() unwraps
+        StartCommandResponse and returns the bare Result message, so async
+        commands (move_to_pose, return_home) and switch_map arrive as
+        {'success': ..., 'errorCode': ...} with no nested 'result' key. The
+        wrapped {'result': {...}} shape is also accepted for safety.
+
+        MessageToDict drops zero-valued fields, so a plain success serializes
+        to {'success': True} and a failure with a non-zero code to
+        {'errorCode': N}. A Result with success=False and error_code=0
+        therefore serializes to {} and is indistinguishable from a response
+        that carries no Result at all; both yield None (callers treat None as
+        success). This edge does not occur for the dispatch-time results
+        handled here, where failures always carry a non-zero error code.
+        """
+        if not isinstance(response, dict):
+            return None
+        if isinstance(response.get('result'), dict):
+            return response['result']
+        if 'success' in response or 'errorCode' in response:
+            return response
+        return None
 
     def _execute_sync_method(
         self,
@@ -1002,20 +1027,7 @@ class KachakaApiClientByZenoh:
             method = getattr(self.kachaka_client, method_name)
             response = self._to_dict(method(**args))
 
-            # Extract the command Result. The kachaka high-level client's
-            # start_command() unwraps StartCommandResponse and returns the bare
-            # Result message, so async commands (move_to_pose, return_home)
-            # arrive as {'success': ..., 'errorCode': ...} with no nested
-            # 'result' key. Handle both the bare Result and the wrapped shape;
-            # MessageToDict converts snake_case to camelCase (error_code ->
-            # errorCode) and drops zero-valued fields.
-            result_dict: Optional[Dict[str, Any]] = None
-            if isinstance(response, dict):
-                if isinstance(response.get('result'), dict):
-                    result_dict = response['result']
-                elif 'success' in response:
-                    result_dict = response
-
+            result_dict = self._extract_command_result(response)
             if result_dict is not None:
                 success = result_dict.get('success', False)
                 error_code = result_dict.get('errorCode', 0)

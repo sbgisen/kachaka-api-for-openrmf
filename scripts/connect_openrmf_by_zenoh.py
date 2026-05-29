@@ -1002,16 +1002,28 @@ class KachakaApiClientByZenoh:
             method = getattr(self.kachaka_client, method_name)
             response = self._to_dict(method(**args))
 
-            # Check if response contains a 'result' field (synchronous commands return Result)
-            if isinstance(response, dict) and 'result' in response:
-                result = response['result']
-                success = result.get('success', False)
-                # Note: MessageToDict converts snake_case to camelCase
-                error_code = result.get('errorCode', 0)
+            # Extract the command Result. The kachaka high-level client's
+            # start_command() unwraps StartCommandResponse and returns the bare
+            # Result message, so async commands (move_to_pose, return_home)
+            # arrive as {'success': ..., 'errorCode': ...} with no nested
+            # 'result' key. Handle both the bare Result and the wrapped shape;
+            # MessageToDict converts snake_case to camelCase (error_code ->
+            # errorCode) and drops zero-valued fields.
+            result_dict: Optional[Dict[str, Any]] = None
+            if isinstance(response, dict):
+                if isinstance(response.get('result'), dict):
+                    result_dict = response['result']
+                elif 'success' in response:
+                    result_dict = response
+
+            if result_dict is not None:
+                success = result_dict.get('success', False)
+                error_code = result_dict.get('errorCode', 0)
 
                 if self.is_async_command and success:
-                    # Async command started, don't publish completion yet
-                    # publish_result will handle completion after RUNNING state is seen
+                    # Async command started, don't publish completion yet.
+                    # publish_result polls GetCommandState/GetLastCommandResult
+                    # and publishes completion after RUNNING state is seen.
                     self.async_command_started_at = time.monotonic()
                     self.logger.info(f'Async command {method_name} started')
                 elif success:
@@ -1023,7 +1035,7 @@ class KachakaApiClientByZenoh:
                     if publish_completion:
                         self._publish_command_completion(success=False, error_code=error_code)
             else:
-                # No result field (e.g., switch_map), assume success
+                # Response carries no success/result info; assume success.
                 self.logger.info(f'Command {method_name} executed successfully')
                 if publish_completion:
                     self._publish_command_completion(success=True, error_code=0)

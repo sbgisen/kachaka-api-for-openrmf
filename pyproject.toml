@@ -1,0 +1,57 @@
+[tool.isort]
+profile = "google"
+line_length = 119
+known_third_party = ["launch"]
+
+[tool.autopep8]
+max_line_length = 119
+ignore = "W503"
+aggressive = 2
+
+[tool.yapf]
+based_on_style = "google"
+column_limit = 119
+
+[tool.ruff]
+line-length = 119
+
+[tool.ruff.lint]
+preview = true
+select = ["A", "ANN", "C4", "CPY", "D", "D401", "E", "F", "N", "Q", "W"]
+ignore = [
+    "ANN002",
+    "ANN003",
+    "ANN1",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D203",
+    "D212",
+    "D404",
+]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-copyright]
+notice-rgx = "# Copyright \\(c\\) [0-9]{4} SoftBank Corp.\n#\n# Licensed under the Apache License, Version 2.0 \\(the \"License\"\\);\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License."
+
+[tool.ruff.lint.flake8-annotations]
+suppress-dummy-args = true
+
+[tool.ruff.format]
+quote-style = "single"
+line-ending = "lf"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require a real Kachaka and Zenoh router",
+]

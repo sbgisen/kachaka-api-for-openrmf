@@ -958,8 +958,14 @@ class KachakaApiClientByZenoh:
                     self._command_context_map_name = rmf_map_name
                     self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
                     self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
+                    # Pose must precede completion: RMF reading (new map_name, stale pose) triggers "too far" replan.
+                    target_pose = payload['pose']
+                    new_pose = Pose(target_pose.get('x', 0.0), target_pose.get('y', 0.0),
+                                    target_pose.get('theta', 0.0))
+                    self.last_pose = new_pose
+                    self._publish_to_zenoh(self.pose_pub, new_pose.as_list())
                     self.logger.info(
-                        'Published map_name=%s to Zenoh after successful switch_map',
+                        'Published map_name=%s and target pose to Zenoh after successful switch_map',
                         rmf_map_name,
                     )
                     self._publish_command_completion(success=True, error_code=0)

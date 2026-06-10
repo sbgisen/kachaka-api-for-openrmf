@@ -1412,15 +1412,6 @@ class KachakaApiClientByZenoh:
             except RpcError as e:
                 retry_count += 1
                 last_error = e
-                self.logger.info('Send Dummy data')
-                self._publish_to_zenoh(self.pose_pub, self.last_pose.as_list())
-                self._publish_to_zenoh(self.battery_pub, self.last_battery)
-                self._publish_to_zenoh(self.map_name_pub, self.map_state.telemetry_map_name)
-                if self.last_command_result:
-                    self._publish_to_zenoh(
-                        self.command_is_completed_pub,
-                        self.last_command_result.as_payload(),
-                    )
                 if e.code() == StatusCode.UNAVAILABLE:
                     self._log_error_msg(f'gRPC connection error ({retry_count}/{max_retries}): {e.details()}')
                     time.sleep(sleep_time)

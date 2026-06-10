@@ -235,7 +235,6 @@ class KachakaApiClientByZenoh:
         self.last_pose = Pose.zero()
         self.last_battery = 100.0
         self.map_state = MapState.initial()
-        self._command_context_map_name: Optional[str] = None
         self.last_command = None
         self.last_command_result = None
         self.last_command_id = None
@@ -424,31 +423,43 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
+    def _fetch_robot_map_name(self, timeout: float) -> str:
+        """Fetch the robot's actual current map name via gRPC.
+
+        Queries GetMapList and GetCurrentMapId on the robot and applies the
+        reverse name mapping so the returned value is the RMF-side map name.
+        This is the single source of truth for the robot's current map.
+
+        Args:
+            timeout (float): The timeout in seconds for each gRPC call.
+
+        Returns:
+            str: The RMF-side name of the map the robot is currently on.
+
+        Raises:
+            RpcError: If either gRPC call fails or times out.
+        """
+        map_list_response = self.kachaka_client.stub.GetMapList(pb2.GetRequest(), timeout=timeout)
+        map_id_response = self.kachaka_client.stub.GetCurrentMapId(pb2.GetRequest(), timeout=timeout)
+
+        search_id = map_id_response.id
+        kachaka_map_name = next(
+            (entry.name for entry in map_list_response.map_list_entries if entry.id == search_id),
+            'L1',
+        )
+        return self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
+
     async def publish_map_name(self) -> None:
         """Publish the current map name to Zenoh.
 
-        Gets the current map ID from Kachaka via gRPC stub with timeout,
-        looks up the map name, applies name mapping, and publishes to Zenoh.
-        On timeout, publishes cached value to keep the telemetry loop running.
+        Gets the current map name from Kachaka via gRPC with timeout and
+        publishes it to Zenoh. On timeout, publishes cached value to keep
+        the telemetry loop running.
         """
         method_name = 'publish_map_name'
         try:
-            map_list_response = self.kachaka_client.stub.GetMapList(pb2.GetRequest(),
-                                                                    timeout=self.grpc_telemetry_timeout)
-            map_id_response = self.kachaka_client.stub.GetCurrentMapId(pb2.GetRequest(),
-                                                                       timeout=self.grpc_telemetry_timeout)
-
-            search_id = map_id_response.id
-            kachaka_map_name = next(
-                (entry.name for entry in map_list_response.map_list_entries if entry.id == search_id),
-                'L1',
-            )
-            map_name = self.reverse_map_name_mapping.get(kachaka_map_name, kachaka_map_name)
+            map_name = self._fetch_robot_map_name(self.grpc_telemetry_timeout)
             self.map_state = self.map_state.with_telemetry_map_name(map_name)
-            with self._command_lock:
-                if self._command_context_map_name is None:
-                    self._command_context_map_name = map_name
-
             self._publish_to_zenoh(self.map_name_pub, map_name)
         except RpcError as e:
             if e.code() == StatusCode.DEADLINE_EXCEEDED:
@@ -838,6 +849,53 @@ class KachakaApiClientByZenoh:
         # error_code=-3: task was replaced by a newer command before completion.
         self._publish_command_completion(success=False, error_code=-3)
 
+    def _verify_map_for_navigation(self, requested_map_name: str) -> bool:
+        """Check that the robot is on the requested map before navigating.
+
+        Compares against the telemetry map name, which is the same value
+        reported to RMF, so the guard can never disagree with what RMF sees.
+        On mismatch the robot is re-queried via gRPC before rejecting: the
+        cached value can diverge from the robot when a switch_map result is
+        lost or the map is changed outside this bridge (e.g. from the
+        smartphone app), and without the re-query a stale cache would reject
+        every navigation command until restart.
+
+        Args:
+            requested_map_name (str): The RMF-side map name of the navigation command.
+
+        Returns:
+            bool: True if navigation may proceed. False if the robot is on a
+                different map or its map could not be determined; a failure
+                completion (error_code=-2) is published in that case.
+        """
+        if requested_map_name == self.map_state.telemetry_map_name:
+            return True
+
+        try:
+            current_map_name = self._fetch_robot_map_name(self.grpc_status_check_timeout)
+        except RpcError as e:
+            self._log_error('RPC', '_verify_map_for_navigation', e)
+            self._log_warning(
+                f'Could not verify current map for navigation to {requested_map_name}. Rejecting navigation command.')
+            self._publish_command_completion(success=False, error_code=-2)
+            return False
+
+        self.map_state = self.map_state.with_telemetry_map_name(current_map_name)
+        self._publish_to_zenoh(self.map_name_pub, current_map_name)
+
+        if requested_map_name == current_map_name:
+            self._log_info(
+                f'Cached map name was stale; robot is actually on {current_map_name}. Proceeding with navigation.')
+            return True
+
+        # Map name mismatch indicates RMF has incorrect floor information.
+        # Reject the navigation command and return error to trigger replanning.
+        self._log_warning(f'Map name mismatch: requested={requested_map_name}, '
+                          f'current={current_map_name}. '
+                          f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
+        self._publish_command_completion(success=False, error_code=-2)
+        return False
+
     def _execute_command(self, command: Dict[str, Any]) -> None:
         """Unified command execution logic."""
         method_name = 'execute_command'
@@ -872,15 +930,7 @@ class KachakaApiClientByZenoh:
                 elif method_name == 'move_to_pose':
                     args = command['args'].copy()
                     map_name = args.pop('map_name', None)
-                    if (map_name is not None and self._command_context_map_name is not None and
-                            map_name != self._command_context_map_name):
-                        # Map name mismatch indicates RMF has incorrect floor information.
-                        # Reject the navigation command and return error to trigger replanning.
-                        self._log_warning(
-                            f'Map name mismatch: requested={map_name}, '
-                            f'current={self._command_context_map_name}. '
-                            f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
-                        self._publish_command_completion(success=False, error_code=-2)
+                    if map_name is not None and not self._verify_map_for_navigation(map_name):
                         return
                     args = self._prepare_async_command_args(args, {'cancel_all': True})
                     self.logger.debug(f'Current pose: {self.last_pose.as_list()}')
@@ -939,7 +989,6 @@ class KachakaApiClientByZenoh:
             # because switch_map method takes long time to complete
             if map_id == current_map_id:
                 rmf_map_name = args.get('map_name')
-                self._command_context_map_name = rmf_map_name
                 self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
                 self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
                 self.logger.info('Nothing to do - already on target map')
@@ -955,7 +1004,6 @@ class KachakaApiClientByZenoh:
                 success = result_dict.get('success', False) if result_dict is not None else True
                 if success:
                     rmf_map_name = args.get('map_name')
-                    self._command_context_map_name = rmf_map_name
                     self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
                     self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
                     # Pose must precede completion: RMF reading (new map_name, stale pose) triggers "too far" replan.
@@ -973,10 +1021,54 @@ class KachakaApiClientByZenoh:
                     self._publish_command_completion(success=False, error_code=-1)
         except RpcError as e:
             self._log_error('RPC', method_name, e)
-            self._publish_command_completion(success=False, error_code=-1)
+            if not self._recover_interrupted_switch_map(args):
+                self._publish_command_completion(success=False, error_code=-1)
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
-            self._publish_command_completion(success=False, error_code=-1)
+            if not self._recover_interrupted_switch_map(args):
+                self._publish_command_completion(success=False, error_code=-1)
+
+    def _recover_interrupted_switch_map(self, args: Dict[str, Any]) -> bool:
+        """Complete a failed-looking switch_map that actually took effect.
+
+        A switch_map gRPC call can succeed on the robot while its response is
+        lost (e.g. DEADLINE_EXCEEDED). Reporting failure in that case leaves
+        the cached map name on the old floor while the robot is already on
+        the new one, so every later move_to_pose would be rejected by the map
+        guard. Re-query the robot and, when it is already on the target map,
+        publish the fresh map_name and actual pose before completing the
+        command as a success, mirroring the normal success path.
+
+        Args:
+            args (dict): The original switch_map arguments.
+
+        Returns:
+            bool: True if the switch was confirmed on the robot and a success
+                completion was published. False if the robot is not on the
+                target map or could not be queried; the caller should publish
+                the failure completion in that case.
+        """
+        rmf_map_name = args.get('map_name')
+        if rmf_map_name is None:
+            return False
+        try:
+            current_map_name = self._fetch_robot_map_name(self.grpc_status_check_timeout)
+            if current_map_name != rmf_map_name:
+                return False
+            response = self.kachaka_client.stub.GetRobotPose(pb2.GetRequest(), timeout=self.grpc_status_check_timeout)
+            pose = Pose(response.pose.x, response.pose.y, response.pose.theta)
+        except Exception as e:
+            self._log_error('Unexpected', '_recover_interrupted_switch_map', e)
+            return False
+
+        self._log_info(f'switch_map result was lost but robot is already on {rmf_map_name}; completing as success')
+        self.map_state = self.map_state.with_telemetry_map_name(rmf_map_name)
+        self._publish_to_zenoh(self.map_name_pub, rmf_map_name)
+        # Pose must precede completion: RMF reading (new map_name, stale pose) triggers "too far" replan.
+        self.last_pose = pose
+        self._publish_to_zenoh(self.pose_pub, pose.as_list())
+        self._publish_command_completion(success=True, error_code=0)
+        return True
 
     @staticmethod
     def _extract_command_result(response: Any) -> Optional[Dict[str, Any]]:  # noqa: ANN401

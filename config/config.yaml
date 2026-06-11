@@ -21,7 +21,7 @@ timeouts:
   command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
 
 intervals:
-  command_check: 4.0        # How often to check for new commands
+  command_check: 1.0        # How often to check for new commands
   main_loop: 1              # How often to publish robot status
 
 # Connection reliability settings

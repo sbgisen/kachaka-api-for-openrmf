@@ -41,7 +41,7 @@ async def init_channel() -> None:
     """
     global kachaka_client
     kachaka_client = kachaka_api.aio.KachakaApiClient(
-        os.getenv("KACHAKA_ACCESS_POINT", "localhost:26400"))
+        os.getenv("KACHAKA_ACCESS_POINT", "100.94.1.1:26400"))
     await kachaka_client.update_resolver()
 
 

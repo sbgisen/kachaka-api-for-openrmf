@@ -18,14 +18,19 @@ timeouts:
   grpc_telemetry: 5.0       # Timeout for telemetry gRPC calls (get_robot_pose, etc.)
   grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
   grpc_stuck: 30.0          # Threshold (sec) for treating persistent Deadline Exceeded as a stuck channel
+  command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
 
 intervals:
-  command_check: 4.0        # How often to check for new commands
+  command_check: 1.0        # How often to check for new commands
   main_loop: 1              # How often to publish robot status
 
 # Connection reliability settings
 connection:
-  max_retries: 20           # Max gRPC connection retries
+  max_retries: 20           # Max gRPC connection retries (startup / run_method path)
+  # Max gRPC connection retries during command dispatch; kept small so a failed
+  # dispatch returns a failure completion to RMF quickly instead of blocking
+  # command handling for minutes.
+  command_max_retries: 2
   max_consecutive_errors: 10  # Exit after this many consecutive errors
 
 # Navigation retry settings

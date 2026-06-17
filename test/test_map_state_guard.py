@@ -131,14 +131,14 @@ def test_guard_rejects_genuine_mismatch() -> None:
     assert node._verify_map_for_navigation('12F') is True  # sanity: robot is on 12F
     node = make_node(telemetry_map_name='12F', robot_map_name='L12')
     assert node._verify_map_for_navigation('8F') is False
-    assert published_completions(node) == [{'success': False, 'error_code': -2}]
+    assert published_completions(node) == [{'success': False, 'error_code': -2, 'task_id': None}]
 
 
 def test_guard_rejects_when_robot_unreachable() -> None:
     """Navigation is rejected (not allowed through) when gRPC fails."""
     node = make_node(telemetry_map_name='12F', grpc_error=True)
     assert node._verify_map_for_navigation('8F') is False
-    assert published_completions(node) == [{'success': False, 'error_code': -2}]
+    assert published_completions(node) == [{'success': False, 'error_code': -2, 'task_id': None}]
     # Cache must not be corrupted on failure
     assert node.map_state.telemetry_map_name == '12F'
 
@@ -150,7 +150,7 @@ def test_recover_interrupted_switch_map_success() -> None:
     assert recovered is True
     assert node.map_state.telemetry_map_name == '8F'
     assert node.last_pose.as_list() == [1.0, 2.0, 0.5]
-    assert published_completions(node) == [{'success': True, 'error_code': 0}]
+    assert published_completions(node) == [{'success': True, 'error_code': 0, 'task_id': None}]
 
 
 def test_recover_interrupted_switch_map_not_switched() -> None:

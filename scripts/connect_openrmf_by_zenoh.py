@@ -169,6 +169,7 @@ class KachakaApiClientByZenoh:
     command_target_map_name: Optional[str]
     command_target_pose: Optional[Pose]
     external_control_active: bool
+    own_return_home_retention: float
 
     # Consecutive command_id mismatches tolerated before undoing a binding
     # (one mismatch is observed roughly once per main loop iteration).
@@ -231,6 +232,7 @@ class KachakaApiClientByZenoh:
         self.command_completion_timeout = float(timeouts.get('command_completion', 180.0))
         self.command_start_timeout = float(timeouts.get('command_start', 15.0))
         self.motion_progress_timeout = float(timeouts.get('motion_progress', 30.0))
+        self.own_return_home_retention = float(timeouts.get('own_return_home_retention', 5.0))
         self.command_check_interval = intervals.get('command_check', 4.0)
 
         # Load navigation tolerance settings (Issue #34 Plan §7.1-§7.3)
@@ -328,6 +330,12 @@ class KachakaApiClientByZenoh:
         # bridge) is observed running on the robot (Issue #34 Plan §7.4).
         self.external_control_active = False
         self._external_command_id: Optional[str] = None
+        # The command_id and expiry of the own dock (return_home) that most
+        # recently completed; lets _is_own_return_home() still recognize a
+        # briefly-lingering RUNNING return_home as ours after task_id has
+        # already been reset (Issue #34 Plan §7.4, Codex review concern (b)).
+        self._recently_own_return_home_id: Optional[str] = None
+        self._recently_own_return_home_until: Optional[float] = None
         # Monotonically increasing sequence number for the unified state
         # payload (Issue #34 Plan §5.1).
         self._state_seq = 0
@@ -650,16 +658,32 @@ class KachakaApiClientByZenoh:
         """Return True when a RUNNING returnHomeCommand belongs to our own dispatched dock.
 
         RMF issues return_home via the 'dock' RMF method (mapped to Kachaka's
-        return_home). Before the command_id has been bound (early in the
-        dispatch), the observed id cannot yet be compared, so any RUNNING
-        return_home while our own dock task is in flight is treated as ours
-        (Issue #34 Plan §7.4).
+        return_home). Once current_command_id has been bound, ownership is
+        decided purely by ID equality. Before it is bound, the observed id
+        cannot yet be compared; an unbound id is treated as plausibly ours
+        only within running_state_wait of our own dispatch (the window in
+        which our own RUNNING is expected to appear) -- not indefinitely, so
+        a genuinely external returnHome that starts before ours binds is
+        eventually recognized as external instead of being assumed ours
+        forever (Issue #34 Plan §7.4, Codex review ISS34-006 blocking
+        finding). A dock that completed just before this poll is still
+        recognized via the short-lived _recently_own_return_home_* grace
+        period (concern (b)), so the trailing RUNNING state Kachaka can
+        report right after completion is not mistaken for external control.
         """
-        if self.task_id is None or self.last_command is None:
-            return False
-        if self.last_command.get('method') != 'dock':
-            return False
-        return self.current_command_id is None or self.current_command_id == observed_command_id
+        if self.task_id is not None and self.last_command is not None and self.last_command.get('method') == 'dock':
+            if self.current_command_id is not None:
+                return self.current_command_id == observed_command_id
+            if self.command_dispatched_at is None:
+                return False
+            return (time.monotonic() - self.command_dispatched_at) < self.running_state_wait
+
+        if (self._recently_own_return_home_id is not None and
+                observed_command_id == self._recently_own_return_home_id and
+                self._recently_own_return_home_until is not None and
+                time.monotonic() < self._recently_own_return_home_until):
+            return True
+        return False
 
     def _handle_external_return_home_started(self, command_id: Optional[str]) -> None:
         """Preempt any active RMF task and mark external control as active."""
@@ -1793,6 +1817,15 @@ class KachakaApiClientByZenoh:
 
             # Clear all async command tracking state after publishing
             if target_task_id == self.task_id:
+                if (self.last_command is not None and self.last_command.get('method') == 'dock' and
+                        self.current_command_id is not None):
+                    # Issue #34 Plan §7.4 concern (b): Kachaka can still report a
+                    # brief lingering RUNNING return_home right after this dock
+                    # completes; remember its id for a short grace period so it
+                    # is not mistaken for an external returnHome once task_id is
+                    # cleared below.
+                    self._recently_own_return_home_id = self.current_command_id
+                    self._recently_own_return_home_until = time.monotonic() + self.own_return_home_retention
                 self._reset_async_command_state()
             return True
 

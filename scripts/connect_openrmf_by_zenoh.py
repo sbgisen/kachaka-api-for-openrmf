@@ -559,6 +559,46 @@ class KachakaApiClientByZenoh:
             return True
         return isinstance(command_dict, dict) and expected_field in command_dict
 
+    def _observed_move_target_matches_dispatch(self, command_dict: Optional[Dict[str, Any]]) -> bool:
+        """Return True when an observed moveToPoseCommand's own target matches what we dispatched.
+
+        Type match alone cannot distinguish our own move_to_pose from a
+        same-type command started by someone else (or a stale one):
+        Kachaka's async StartCommand never returns commandId synchronously
+        (KachakaApiClient.start_command discards it when wait_for_completion
+        is False), so before a command_id is bound, only the observed
+        command's own x/y/yaw -- not just its type -- can confirm it is the
+        command we just sent (Codex re-review ISS34-010 blocking-2, Issue
+        #34 Plan §7.3). When command_target_pose was not set (dispatch did
+        not go through the move_to_pose branch), there is nothing to compare
+        against and the check is skipped so type-only matching still applies.
+        """
+        if self.command_target_pose is None:
+            return True
+        if not isinstance(command_dict, dict):
+            return False
+        observed = command_dict.get('moveToPoseCommand')
+        if not isinstance(observed, dict):
+            return False
+        distance = math.hypot(
+            observed.get('x', 0.0) - self.command_target_pose.x,
+            observed.get('y', 0.0) - self.command_target_pose.y,
+        )
+        yaw_diff = abs(self._normalize_angle(observed.get('yaw', 0.0) - self.command_target_pose.theta))
+        return distance <= self.command_match_distance_tolerance and yaw_diff <= self.command_match_yaw_tolerance
+
+    def _observed_command_confirmed_for_bind(self, command_dict: Optional[Dict[str, Any]]) -> bool:
+        """Return True when an observed command can be confirmed as the one we dispatched.
+
+        Combines the type-match gate with the move_to_pose target check so
+        every command_id-binding call site rejects a same-type command that
+        cannot be confirmed as ours, rather than binding on type alone
+        (Codex re-review ISS34-010 blocking-2, Issue #34 Plan §7.3).
+        """
+        if not self._observed_command_type_matches_expected(command_dict):
+            return False
+        return self._observed_move_target_matches_dispatch(command_dict)
+
     def _record_motion_progress_baseline(self) -> None:
         """Reset the motion_progress baseline to the current pose and time."""
         self._motion_progress_pose = self.last_pose
@@ -965,12 +1005,14 @@ class KachakaApiClientByZenoh:
 
                 if self.is_async_command:
                     if (self.current_command_id is None and self._is_running_state(state_value) and
-                            not self._observed_command_type_matches_expected(command_dict)):
-                        # A RUNNING command of the wrong type must never be bound to
-                        # this task, even before any command_id has been bound
-                        # (Issue #34 Plan §7.3, Codex review ISS34-006 blocking finding).
+                            not self._observed_command_confirmed_for_bind(command_dict)):
+                        # A RUNNING command that cannot be confirmed as ours (wrong
+                        # type, or for move_to_pose a mismatched target) must never
+                        # be bound to this task, even before any command_id has been
+                        # bound (Issue #34 Plan §7.3, Codex review ISS34-006/ISS34-010
+                        # blocking findings).
                         self.logger.debug(
-                            'Ignoring RUNNING command_id %s for task %s: type mismatch (expected %s)',
+                            'Ignoring RUNNING command_id %s for task %s: not confirmed as ours (expected %s)',
                             command_id,
                             self.task_id,
                             self.expected_kachaka_method,
@@ -1011,7 +1053,7 @@ class KachakaApiClientByZenoh:
 
                 if self.is_async_command and not self.saw_running:
                     if (self.current_command_id is None and command_id and self._running_state_wait_expired() and
-                            self._observed_command_type_matches_expected(command_dict)):
+                            self._observed_command_confirmed_for_bind(command_dict)):
                         self.current_command_id = command_id
                         self._log_warning(f'RUNNING state was not observed within {self.running_state_wait}s; '
                                           f'falling back to command_id={command_id} for task {self.task_id}')
@@ -1028,9 +1070,9 @@ class KachakaApiClientByZenoh:
 
                 if self.is_async_command:
                     if (self.current_command_id is None and self.saw_running and result_command_id and
-                            not self._observed_command_type_matches_expected(result_command_dict)):
+                            not self._observed_command_confirmed_for_bind(result_command_dict)):
                         self._log_warning(f'Ignoring result command_id {result_command_id} for task {self.task_id}: '
-                                          f'type mismatch (expected {self.expected_kachaka_method})')
+                                          f'not confirmed as ours (expected {self.expected_kachaka_method})')
                         return
                     if result_command_id:
                         if self.current_command_id is None and self.saw_running:
@@ -1089,6 +1131,7 @@ class KachakaApiClientByZenoh:
                 # Publish and reset
                 self.last_command_result = result
                 if self._publish_to_zenoh(self.command_is_completed_pub, result.as_payload()) and result.is_completed:
+                    self._record_own_return_home_retention()
                     self._reset_async_command_state()
 
         except RpcError as e:
@@ -1733,6 +1776,23 @@ class KachakaApiClientByZenoh:
             self._publish_command_completion(success=False, error_code=-1, task_id=task_id)
             raise
 
+    def _record_own_return_home_retention(self) -> None:
+        """Remember a completing dock's command_id for the ownership grace period.
+
+        Must run on every completion path immediately before
+        _reset_async_command_state() clears current_command_id, not only
+        the explicit _publish_command_completion() path: publish_result()'s
+        normal async-success completion calls _reset_async_command_state()
+        directly and previously bypassed this recording entirely, so
+        _is_own_return_home() had no record to recognize a briefly-lingering
+        RUNNING return_home right after an ordinary dock success (Issue #34
+        Plan §7.4 concern (b), Codex re-review ISS34-010 recommendation-2).
+        """
+        if (self.last_command is not None and self.last_command.get('method') == 'dock' and
+                self.current_command_id is not None):
+            self._recently_own_return_home_id = self.current_command_id
+            self._recently_own_return_home_until = time.monotonic() + self.own_return_home_retention
+
     def _reset_async_command_state(self) -> None:
         """Reset all async command tracking state.
 
@@ -1830,15 +1890,7 @@ class KachakaApiClientByZenoh:
 
             # Clear all async command tracking state after publishing
             if target_task_id == self.task_id:
-                if (self.last_command is not None and self.last_command.get('method') == 'dock' and
-                        self.current_command_id is not None):
-                    # Issue #34 Plan §7.4 concern (b): Kachaka can still report a
-                    # brief lingering RUNNING return_home right after this dock
-                    # completes; remember its id for a short grace period so it
-                    # is not mistaken for an external returnHome once task_id is
-                    # cleared below.
-                    self._recently_own_return_home_id = self.current_command_id
-                    self._recently_own_return_home_until = time.monotonic() + self.own_return_home_retention
+                self._record_own_return_home_retention()
                 self._reset_async_command_state()
             return True
 

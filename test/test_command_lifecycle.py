@@ -726,6 +726,75 @@ def test_correct_type_running_command_binds_when_dispatch_lacked_command_id() ->
     assert published_payloads(node) == [{'id': 'cmd-bind-ok', 'is_completed': False}]
 
 
+def test_same_type_running_command_with_mismatched_target_is_not_bound() -> None:
+    """A same-type RUNNING move_to_pose toward a different target is not bound to our task.
+
+    Reproduces Codex re-review ISS34-010 blocking-2: the previous bind
+    condition checked only that the observed command's type matched
+    (moveToPoseCommand), so a same-type command started by someone else (or
+    a stale one) toward a different destination would still bind and its
+    later success would be reported to RMF as our task's success. Binding
+    must also confirm the observed command's own target matches what we
+    dispatched (Issue #34 Plan §7.3).
+    """
+    node = make_node()
+    node.task_id = 'cmd-ext-move'
+    node.is_async_command = True
+    node.saw_running = False
+    node.current_command_id = None
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_dispatched_at = time.monotonic()
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'external-move-1',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 5.0,
+                    'y': 5.0,
+                    'yaw': 0.0
+                },
+            },
+        })
+
+    asyncio.run(node.publish_result())
+
+    assert node.current_command_id is None
+    assert node.saw_running is False
+    assert published_payloads(node) == []
+
+
+def test_same_type_running_command_with_matching_target_still_binds() -> None:
+    """A same-type RUNNING move_to_pose whose own target matches ours still binds normally."""
+    node = make_node()
+    node.task_id = 'cmd-own-move'
+    node.is_async_command = True
+    node.saw_running = False
+    node.current_command_id = None
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_dispatched_at = time.monotonic()
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'own-move-1',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.05,
+                    'y': 0.98,
+                    'yaw': 0.01
+                },
+            },
+        })
+
+    asyncio.run(node.publish_result())
+
+    assert node.current_command_id == 'own-move-1'
+    assert node.saw_running is True
+    assert published_payloads(node) == [{'id': 'cmd-own-move', 'is_completed': False}]
+
+
 # ---------------------------------------------------------------------------
 # Issue #34 Plan §7.2: command_dispatched_at origin (Codex review non-blocking finding)
 # ---------------------------------------------------------------------------
@@ -900,6 +969,60 @@ def test_own_return_home_retention_recorded_on_dock_completion() -> None:
     assert node._recently_own_return_home_until is not None
     assert node._recently_own_return_home_until > time.monotonic()
     assert node.task_id is None
+
+
+def test_own_return_home_retention_recorded_via_publish_result_completion_path() -> None:
+    """Own ID retention must also be recorded on the ordinary publish_result() success path.
+
+    Reproduces Codex re-review ISS34-010 recommendation-2: the retention
+    record was previously written only inside _publish_command_completion(),
+    but a normal async dock success completes through publish_result()'s own
+    publish-and-reset branch, which called _reset_async_command_state()
+    directly and skipped the record entirely. Without it, a briefly
+    lingering RUNNING return_home right after an ordinary dock success would
+    be misclassified as external control (Issue #34 Plan §7.4 concern (b)).
+    """
+    node = make_node()
+    node.task_id = 'cmd-dock-normal'
+    node.last_command = {'id': 'cmd-dock-normal', 'method': 'dock', 'args': {}}
+    node.is_async_command = True
+    node.saw_running = True
+    node.current_command_id = 'own-return-home-normal'
+    node.expected_kachaka_method = 'return_home'
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'own-return-home-normal',
+        'state': 'COMMAND_STATE_SUCCEEDED'
+    })
+    node._get_last_command_result_response = MagicMock(
+        return_value={
+            'commandId': 'own-return-home-normal',
+            'result': {
+                'success': True,
+                'errorCode': 0
+            },
+            'command': {
+                'returnHomeCommand': {}
+            },
+        })
+
+    asyncio.run(node.publish_result())
+
+    assert published_payloads(node) == [{'id': 'cmd-dock-normal', 'is_completed': True, 'success': True}]
+    assert node.task_id is None
+    assert node._recently_own_return_home_id == 'own-return-home-normal'
+    assert node._recently_own_return_home_until is not None
+    assert node._recently_own_return_home_until > time.monotonic()
+
+    # A lingering RUNNING return_home right after must still be recognized as ours.
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'own-return-home-normal',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+    asyncio.run(node.monitor_external_control())
+    assert node.external_control_active is False
 
 
 def test_external_control_active_rejects_new_rmf_command_with_external_busy() -> None:

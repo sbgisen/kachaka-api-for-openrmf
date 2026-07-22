@@ -520,6 +520,37 @@ class KachakaApiClientByZenoh:
         yaw_diff = abs(self._normalize_angle(target_yaw - self.last_pose.theta))
         return distance <= distance_tolerance and yaw_diff <= yaw_tolerance
 
+    def _fresh_floor_matches(self, requested_map_name: str) -> bool:
+        """Re-fetch the robot's current floor via gRPC and compare with requested_map_name.
+
+        Gates the near-distance no-op shortcut (Issue #34 Plan §7.1, Codex
+        review ISS34-006 concern (a)): the shortcut must never rely on cached
+        telemetry, because a switch_map racing the last telemetry read would
+        otherwise let a stale floor/pose combination short-circuit to
+        success. Always re-queries, even when the cache already agrees with
+        requested_map_name.
+        """
+        try:
+            current_map_name = self._fetch_robot_map_name(self.grpc_status_check_timeout)
+        except RpcError as e:
+            self._log_error('RPC', '_fresh_floor_matches', e)
+            return False
+        self.map_state = self.map_state.with_telemetry_map_name(current_map_name)
+        self._publish_to_zenoh(self.map_name_pub, current_map_name)
+        return current_map_name == requested_map_name
+
+    def _observed_command_type_matches_expected(self, command_dict: Optional[Dict[str, Any]]) -> bool:
+        """Return True when an observed Kachaka command payload's type matches expected_kachaka_method.
+
+        Used to gate the first bind of current_command_id (Issue #34 Plan
+        §7.3): a RUNNING/result command of the wrong type must never be bound
+        to the active RMF task, even before any command_id has been bound.
+        """
+        expected_field = self.COMMAND_TYPE_FIELD.get(self.expected_kachaka_method or '')
+        if expected_field is None:
+            return True
+        return isinstance(command_dict, dict) and expected_field in command_dict
+
     def _record_motion_progress_baseline(self) -> None:
         """Reset the motion_progress baseline to the current pose and time."""
         self._motion_progress_pose = self.last_pose
@@ -1374,13 +1405,19 @@ class KachakaApiClientByZenoh:
                         target_x = args.get('x')
                         target_y = args.get('y')
                         target_yaw = args.get('yaw', 0.0)
-                        if (target_x is not None and target_y is not None and self._is_near_target(
-                                target_x,
-                                target_y,
-                                target_yaw,
-                                distance_tolerance=self.noop_distance_tolerance,
-                                yaw_tolerance=self.noop_yaw_tolerance,
-                        )):
+                        # map_name is required for the shortcut (a missing floor can
+                        # never be confirmed) and the near-target check runs first
+                        # since it is cheap; the fresh floor re-query only happens
+                        # for candidates that are otherwise about to short-circuit
+                        # (Issue #34 Plan §7.1, Codex review ISS34-006 concern (a)).
+                        if (map_name is not None and target_x is not None and target_y is not None and
+                                self._is_near_target(
+                                    target_x,
+                                    target_y,
+                                    target_yaw,
+                                    distance_tolerance=self.noop_distance_tolerance,
+                                    yaw_tolerance=self.noop_yaw_tolerance,
+                                ) and self._fresh_floor_matches(map_name)):
                             self._log_info(
                                 f'Target within noop tolerance (distance<={self.noop_distance_tolerance}m, '
                                 f'yaw<={self.noop_yaw_tolerance}rad); reporting success without calling Kachaka')

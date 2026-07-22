@@ -121,6 +121,9 @@ def make_node(client_methods: list = []) -> KachakaApiClientByZenoh:
     node.command_target_pose = None
     node.external_control_active = False
     node._external_command_id = None
+    node.own_return_home_retention = 5.0
+    node._recently_own_return_home_id = None
+    node._recently_own_return_home_until = None
     node._state_seq = 0
     return node
 
@@ -289,6 +292,7 @@ def test_move_to_pose_short_circuits_within_noop_tolerance() -> None:
     node._execute_sync_method = MagicMock()
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._fetch_robot_map_name = MagicMock(return_value='8F')
 
     node._execute_command({
         'id': 'cmd-noop',
@@ -302,6 +306,9 @@ def test_move_to_pose_short_circuits_within_noop_tolerance() -> None:
     })
 
     node._execute_sync_method.assert_not_called()
+    # The shortcut must always re-query the floor, even though the cache already
+    # agreed with the requested map_name (Issue #34 Plan §7.1 concern (a)).
+    node._fetch_robot_map_name.assert_called_once()
     assert published_payloads(node) == [{'id': 'cmd-noop', 'is_completed': True, 'success': True}]
     assert node.task_id is None
 
@@ -311,6 +318,8 @@ def test_move_to_pose_short_circuits_across_pi_seam() -> None:
     node = make_node(client_methods=['move_to_pose'])
     node._execute_sync_method = MagicMock()
     node.last_pose = Pose(0.0, 0.0, 3.10)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._fetch_robot_map_name = MagicMock(return_value='8F')
 
     node._execute_command({
         'id': 'cmd-noop-wrap',
@@ -319,12 +328,110 @@ def test_move_to_pose_short_circuits_across_pi_seam() -> None:
             'x': 0.0,
             'y': 0.0,
             'yaw': -3.10,
-            'map_name': None
+            'map_name': '8F'
         },
     })
 
     node._execute_sync_method.assert_not_called()
     assert published_payloads(node) == [{'id': 'cmd-noop-wrap', 'is_completed': True, 'success': True}]
+
+
+def test_move_to_pose_does_not_short_circuit_without_map_name() -> None:
+    """A missing map_name never short-circuits, even at zero distance (Plan §7.1)."""
+    node = make_node(client_methods=['move_to_pose'])
+    node._execute_sync_method = MagicMock(return_value={'commandId': 'grpc-nomap'})
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    node._fetch_robot_map_name = MagicMock(return_value='8F')
+
+    node._execute_command({
+        'id': 'cmd-nomap',
+        'method': 'move_to_pose',
+        'args': {
+            'x': 0.0,
+            'y': 0.0,
+            'yaw': 0.0,
+            'map_name': None
+        },
+    })
+
+    node._fetch_robot_map_name.assert_not_called()
+    node._execute_sync_method.assert_called_once()
+    assert published_payloads(node) == []
+
+
+def test_move_to_pose_short_circuit_requires_fresh_floor_match() -> None:
+    """A stale cache match is not enough: a fresh floor mismatch dispatches instead of short-circuiting."""
+    node = make_node(client_methods=['move_to_pose'])
+    node._execute_sync_method = MagicMock(return_value={'commandId': 'grpc-stale'})
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    # Cache says 8F (matches the request) but the robot has actually switched to 9F
+    # since the last telemetry read -- exactly the switch_map race in concern (a).
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._fetch_robot_map_name = MagicMock(return_value='9F')
+
+    node._execute_command({
+        'id': 'cmd-stale-floor',
+        'method': 'move_to_pose',
+        'args': {
+            'x': 0.0,
+            'y': 0.0,
+            'yaw': 0.0,
+            'map_name': '8F'
+        },
+    })
+
+    node._fetch_robot_map_name.assert_called_once()
+    node._execute_sync_method.assert_called_once()
+    assert published_payloads(node) == []
+
+
+def test_move_to_pose_short_circuits_at_exact_boundary() -> None:
+    """Exactly 0.15m / 0.10rad (the inclusive boundary) still short-circuits."""
+    node = make_node(client_methods=['move_to_pose'])
+    node._execute_sync_method = MagicMock()
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._fetch_robot_map_name = MagicMock(return_value='8F')
+
+    node._execute_command({
+        'id': 'cmd-boundary',
+        'method': 'move_to_pose',
+        'args': {
+            'x': 0.15,
+            'y': 0.0,
+            'yaw': 0.10,
+            'map_name': '8F'
+        },
+    })
+
+    node._execute_sync_method.assert_not_called()
+    assert published_payloads(node) == [{'id': 'cmd-boundary', 'is_completed': True, 'success': True}]
+
+
+def test_move_to_pose_dispatches_when_only_yaw_exceeds_tolerance() -> None:
+    """Distance within tolerance but yaw beyond it dispatches a normal command."""
+    node = make_node(client_methods=['move_to_pose'])
+    node._execute_sync_method = MagicMock(return_value={'commandId': 'grpc-yaw'})
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._fetch_robot_map_name = MagicMock(return_value='8F')
+
+    node._execute_command({
+        'id': 'cmd-yaw-out',
+        'method': 'move_to_pose',
+        'args': {
+            'x': 0.0,
+            'y': 0.0,
+            'yaw': 0.11,
+            'map_name': '8F'
+        },
+    })
+
+    # yaw alone exceeds noop_yaw_tolerance (0.10rad); the shortcut's cheap
+    # near-target check must reject it before any fresh floor re-query.
+    node._fetch_robot_map_name.assert_not_called()
+    node._execute_sync_method.assert_called_once()
+    assert published_payloads(node) == []
 
 
 def test_move_to_pose_dispatches_when_outside_noop_tolerance() -> None:
@@ -533,6 +640,126 @@ def test_matching_command_type_and_floor_reports_success() -> None:
     assert published_payloads(node) == [{'id': 'cmd-ok', 'is_completed': True, 'success': True}]
 
 
+def test_final_pose_mismatch_is_not_reported_as_success() -> None:
+    """A same-ID, same-type, same-floor success far from the target pose is rejected."""
+    node = make_node()
+    node.task_id = 'cmd-pose'
+    node.is_async_command = True
+    node.saw_running = True
+    node.current_command_id = 'grpc-pose'
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_target_map_name = '8F'
+    node.command_target_pose = Pose(10.0, 10.0, 0.0)
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'grpc-pose',
+        'state': 'COMMAND_STATE_UNKNOWN'
+    })
+    node._get_last_command_result_response = MagicMock(return_value={
+        'commandId': 'grpc-pose',
+        'result': {
+            'success': True,
+            'errorCode': 0
+        },
+        'command': {
+            'moveToPoseCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert published_payloads(node) == [{'id': 'cmd-pose', 'is_completed': True, 'success': False}]
+
+
+def test_wrong_type_running_command_is_not_bound_when_dispatch_lacked_command_id() -> None:
+    """A StartCommand response without commandId must not let a wrong-type RUNNING command bind later.
+
+    Reproduces Codex review ISS34-006's blocking finding: high-level
+    StartCommand often returns a bare Result with no commandId, so
+    current_command_id stays unbound after dispatch. Binding must still
+    require the observed command's type to match what was dispatched.
+    """
+    node = make_node()
+    node.task_id = 'cmd-nobind'
+    node.is_async_command = True
+    node.saw_running = False
+    node.current_command_id = None  # StartCommand response carried no commandId
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_dispatched_at = time.monotonic()
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'unrelated-running-1',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert node.current_command_id is None
+    assert node.saw_running is False
+    assert published_payloads(node) == []
+
+
+def test_correct_type_running_command_binds_when_dispatch_lacked_command_id() -> None:
+    """A matching-type RUNNING command still binds normally after a commandId-less dispatch."""
+    node = make_node()
+    node.task_id = 'cmd-bind-ok'
+    node.is_async_command = True
+    node.saw_running = False
+    node.current_command_id = None
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_dispatched_at = time.monotonic()
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'grpc-bind-ok',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'moveToPoseCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert node.current_command_id == 'grpc-bind-ok'
+    assert node.saw_running is True
+    assert published_payloads(node) == [{'id': 'cmd-bind-ok', 'is_completed': False}]
+
+
+# ---------------------------------------------------------------------------
+# Issue #34 Plan §7.2: command_dispatched_at origin (Codex review non-blocking finding)
+# ---------------------------------------------------------------------------
+
+
+def test_command_dispatched_at_set_only_after_successful_dispatch() -> None:
+    """command_dispatched_at is set at dispatch success, not before grpc_connection_check."""
+    node = make_node(client_methods=['move_to_pose'])
+    node.is_async_command = True
+    node.command_dispatched_at = None
+    node.grpc_connection_check = MagicMock(return_value=True)
+    node.kachaka_client.move_to_pose.configure_mock(return_value={'success': True, 'errorCode': 0})
+
+    node._execute_sync_method('move_to_pose', {'x': 1.0, 'y': 0.0, 'yaw': 0.0}, task_id='cmd-dispatch')
+
+    assert node.command_dispatched_at is not None
+    assert time.monotonic() - node.command_dispatched_at < 1.0
+
+
+def test_command_dispatched_at_stays_none_when_connection_check_fails() -> None:
+    """A failed grpc_connection_check never sets command_dispatched_at."""
+    node = make_node(client_methods=['move_to_pose'])
+    node.is_async_command = True
+    node.command_dispatched_at = None
+    node.grpc_connection_check = MagicMock(return_value=False)
+
+    try:
+        node._execute_sync_method('move_to_pose', {'x': 1.0, 'y': 0.0, 'yaw': 0.0}, task_id='cmd-dispatch-fail')
+    except ConnectionError:
+        pass
+
+    assert node.command_dispatched_at is None
+
+
 # ---------------------------------------------------------------------------
 # Issue #34 Plan §7.4: external returnHome
 # ---------------------------------------------------------------------------
@@ -568,6 +795,7 @@ def test_own_dock_return_home_is_not_treated_as_external() -> None:
     node = make_node()
     node.task_id = 'cmd-dock'
     node.last_command = {'id': 'cmd-dock', 'method': 'dock', 'args': {}}
+    node.command_dispatched_at = time.monotonic()
     node._get_command_state_response = MagicMock(return_value={
         'commandId': 'own-return-home-1',
         'state': 'COMMAND_STATE_RUNNING',
@@ -581,6 +809,97 @@ def test_own_dock_return_home_is_not_treated_as_external() -> None:
     assert published_payloads(node) == []
     assert node.external_control_active is False
     assert node.task_id == 'cmd-dock'
+
+
+def test_external_return_home_id_conflict_with_rmf_dock_is_not_reported_as_success() -> None:
+    """An external returnHome racing our own dock dispatch is never confused for our dock's success.
+
+    Reproduces Codex review ISS34-006's blocking scenario: our own dock is
+    dispatched but has not yet bound a command_id, an externally-triggered
+    returnHome is RUNNING under a different id, and the dispatch grace period
+    (running_state_wait) has elapsed without our own RUNNING appearing. The
+    external command must be recognized as external (preempting our task with
+    external_preempted), not attributed to our dock as a success.
+    """
+    node = make_node()
+    node.task_id = 'cmd-dock'
+    node.last_command = {'id': 'cmd-dock', 'method': 'dock', 'args': {}}
+    node.command_dispatched_at = time.monotonic() - (node.running_state_wait + 1.0)
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'ext-return-home-2',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-dock',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+
+    # Even if the external returnHome later reports success, there is no
+    # active task left to misattribute it to: publish_result has nothing to
+    # poll for once task_id has been cleared by the preemption above.
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'ext-return-home-2',
+        'state': 'COMMAND_STATE_SUCCEEDED'
+    })
+    asyncio.run(node.publish_result())
+    assert node.last_command_result == CommandCompletion('cmd-dock', True, False, -8, 'external_preempted')
+
+
+def test_recently_completed_dock_return_home_is_not_treated_as_external() -> None:
+    """A dock that just completed is not mistaken for external control (concern (b)).
+
+    Kachaka can still report a briefly-lingering RUNNING return_home right
+    after our own dock completes; the short retention grace period recognizes
+    it as ours so a following RMF move is not rejected with external_busy.
+    """
+    node = make_node(client_methods=['move_to_pose'])
+    node.task_id = None  # dock already completed; task_id was reset
+    node.last_command = {'id': 'cmd-dock-done', 'method': 'dock', 'args': {}}
+    node._recently_own_return_home_id = 'own-return-home-2'
+    node._recently_own_return_home_until = time.monotonic() + node.own_return_home_retention
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'own-return-home-2',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert node.external_control_active is False
+    assert published_payloads(node) == []
+
+    # A following RMF move must not be rejected with external_busy.
+    node._execute_sync_method = MagicMock(return_value={'commandId': 'grpc-next-move'})
+    node._execute_command({'id': 'cmd-next-move', 'method': 'move_to_pose', 'args': {'x': 5.0, 'y': 5.0}})
+    assert published_payloads(node) == []
+    node._execute_sync_method.assert_called_once()
+
+
+def test_own_return_home_retention_recorded_on_dock_completion() -> None:
+    """A successful dock completion records its command_id for the retention grace period."""
+    node = make_node()
+    node.task_id = 'cmd-dock-3'
+    node.last_command = {'id': 'cmd-dock-3', 'method': 'dock', 'args': {}}
+    node.current_command_id = 'own-return-home-3'
+
+    assert node._publish_command_completion(success=True, error_code=0) is True
+
+    assert node._recently_own_return_home_id == 'own-return-home-3'
+    assert node._recently_own_return_home_until is not None
+    assert node._recently_own_return_home_until > time.monotonic()
+    assert node.task_id is None
 
 
 def test_external_control_active_rejects_new_rmf_command_with_external_busy() -> None:

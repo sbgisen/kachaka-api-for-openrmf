@@ -20,6 +20,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -54,29 +55,36 @@ class Pose:
 class CommandCompletion:
     """Internal command completion state.
 
-    as_payload() publishes {id, is_completed, success} to Zenoh.
+    as_payload() publishes {id, is_completed, success, reason} to Zenoh.
     error_code is kept on the instance for the Kachaka-side retry logic
-    but is NOT published — see as_payload().
+    but is NOT published — see as_payload(). reason IS published (it is an
+    optional field existing consumers can ignore, see Issue #34 Plan §5.2).
 
     error_code values used internally (not transmitted):
         0   : success
         -1  : unknown / format error
-        -2  : map name mismatch
+        -2  : map name mismatch (reason='map_mismatch')
         -3  : superseded by a new command
         -4  : gRPC channel persistently stuck (Deadline Exceeded > grpc_stuck threshold)
         -5  : completion watchdog expired (no RUNNING/completion observed in time)
+        -6  : no RUNNING observed within command_start timeout (reason='start_timeout')
+        -7  : no motion progress within motion_progress timeout (reason='progress_timeout')
+        -8  : preempted by an externally-triggered returnHome (reason='external_preempted')
+        -9  : rejected while external control is active (reason='external_busy')
     """
 
     task_id: str
     is_completed: bool
     success: Optional[bool]
     error_code: Optional[int]
+    reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.task_id:
             raise ValueError('task_id must not be empty')
-        if not self.is_completed and (self.success is not None or self.error_code is not None):
-            raise ValueError('in-progress completion must not have success or error_code')
+        if not self.is_completed and (self.success is not None or self.error_code is not None or
+                                      self.reason is not None):
+            raise ValueError('in-progress completion must not have success, error_code or reason')
 
     def as_payload(self) -> Dict[str, Any]:
         """Return the payload for Zenoh publishing.
@@ -89,6 +97,8 @@ class CommandCompletion:
         }
         if self.is_completed and self.success is not None:
             payload['success'] = self.success
+        if self.is_completed and self.reason is not None:
+            payload['reason'] = self.reason
         return payload
 
 
@@ -145,10 +155,33 @@ class KachakaApiClientByZenoh:
     retry_interval: float
     retry_on_error_types: List[str]
     retry_count: int
+    state_pub: zenoh.Publisher
+    noop_distance_tolerance: float
+    noop_yaw_tolerance: float
+    progress_distance_delta: float
+    progress_yaw_delta: float
+    command_match_distance_tolerance: float
+    command_match_yaw_tolerance: float
+    command_start_timeout: float
+    motion_progress_timeout: float
+    command_dispatched_at: Optional[float]
+    expected_kachaka_method: Optional[str]
+    command_target_map_name: Optional[str]
+    command_target_pose: Optional[Pose]
+    external_control_active: bool
 
     # Consecutive command_id mismatches tolerated before undoing a binding
     # (one mismatch is observed roughly once per main loop iteration).
     MAX_IGNORED_MISMATCHES = 5
+
+    # Maps the internal (post method_mapping) Kachaka method name to the
+    # protobuf Command oneof field MessageToDict() produces, used by
+    # _validate_command_match() to confirm a result actually belongs to the
+    # command type that was dispatched (Issue #34 Plan §7.3).
+    COMMAND_TYPE_FIELD = {
+        'move_to_pose': 'moveToPoseCommand',
+        'return_home': 'returnHomeCommand',
+    }
 
     def __init__(
         self,
@@ -187,6 +220,7 @@ class KachakaApiClientByZenoh:
         intervals = config.get('intervals', {})
         connection = config.get('connection', {})
         navigation_retry = config.get('navigation_retry', {})
+        navigation = config.get('navigation', {})
 
         self.command_query_timeout = timeouts.get('command_query', 2.0)
         self.grpc_connection_sleep = timeouts.get('grpc_connection', 5)
@@ -195,7 +229,17 @@ class KachakaApiClientByZenoh:
         self.grpc_status_check_timeout = timeouts.get('grpc_status_check', 5.0)
         self.grpc_stuck_threshold = float(timeouts.get('grpc_stuck', 30.0))
         self.command_completion_timeout = float(timeouts.get('command_completion', 180.0))
+        self.command_start_timeout = float(timeouts.get('command_start', 15.0))
+        self.motion_progress_timeout = float(timeouts.get('motion_progress', 30.0))
         self.command_check_interval = intervals.get('command_check', 4.0)
+
+        # Load navigation tolerance settings (Issue #34 Plan §7.1-§7.3)
+        self.noop_distance_tolerance = float(navigation.get('noop_distance_tolerance', 0.15))
+        self.noop_yaw_tolerance = float(navigation.get('noop_yaw_tolerance', 0.10))
+        self.progress_distance_delta = float(navigation.get('progress_distance_delta', 0.02))
+        self.progress_yaw_delta = float(navigation.get('progress_yaw_delta', 0.02))
+        self.command_match_distance_tolerance = float(navigation.get('command_match_distance_tolerance', 0.75))
+        self.command_match_yaw_tolerance = float(navigation.get('command_match_yaw_tolerance', 0.35))
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
         self.command_max_retries = connection.get('command_max_retries', 2)
@@ -226,6 +270,7 @@ class KachakaApiClientByZenoh:
         self.map_name_pub = self.session.declare_publisher(f'robots/{self.robot_name}/map_name')
         self.command_is_completed_pub = self.session.declare_publisher(
             f'robots/{self.robot_name}/command_is_completed')
+        self.state_pub = self.session.declare_publisher(f'robots/{self.robot_name}/state')
 
         # Initialize queryable for request-reply pattern
         self.status_queryable = self.session.declare_queryable(f'robots/{self.robot_name}/status',
@@ -265,6 +310,27 @@ class KachakaApiClientByZenoh:
         # Consecutive polls whose state/result command_id mismatched the bound
         # current_command_id; used to detect and undo a wrong binding.
         self._ignored_result_count = 0
+        # Monotonic dispatch time of the active async command; drives the
+        # command_start timeout (RUNNING must be observed before it expires).
+        self.command_dispatched_at: Optional[float] = None
+        # Pose baseline and timestamp for the motion_progress timeout: reset
+        # whenever the robot's position/yaw moves beyond the configured delta
+        # while RUNNING, so a stalled-in-place RUNNING command still times out.
+        self._motion_progress_pose: Optional[Pose] = None
+        self._motion_progress_at: Optional[float] = None
+        # Expected Kachaka command type/target for the active async command,
+        # used to confirm a success result actually matches what was
+        # dispatched (Issue #34 Plan §7.3).
+        self.expected_kachaka_method: Optional[str] = None
+        self.command_target_map_name: Optional[str] = None
+        self.command_target_pose: Optional[Pose] = None
+        # True while an externally-triggered returnHome (not issued by this
+        # bridge) is observed running on the robot (Issue #34 Plan §7.4).
+        self.external_control_active = False
+        self._external_command_id: Optional[str] = None
+        # Monotonically increasing sequence number for the unified state
+        # payload (Issue #34 Plan §5.1).
+        self._state_seq = 0
 
     def _get_zenoh_config(self, zenoh_router: str) -> zenoh.Config:
         """Get Zenoh configuration with the provided router.
@@ -431,6 +497,190 @@ class KachakaApiClientByZenoh:
                 self.current_command_id,
             )
 
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        """Normalize an angle (radians) to (-pi, pi], wrapping across the +/-pi seam."""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def _is_near_target(
+        self,
+        target_x: float,
+        target_y: float,
+        target_yaw: float,
+        distance_tolerance: float,
+        yaw_tolerance: float,
+    ) -> bool:
+        """Return True when the last known pose is within tolerance of the target.
+
+        Used both for the near-distance short-circuit (§7.1, noop_* tolerances)
+        and to confirm a Kachaka success actually reached the RMF-requested
+        target (§7.3, command_match_* tolerances).
+        """
+        distance = math.hypot(target_x - self.last_pose.x, target_y - self.last_pose.y)
+        yaw_diff = abs(self._normalize_angle(target_yaw - self.last_pose.theta))
+        return distance <= distance_tolerance and yaw_diff <= yaw_tolerance
+
+    def _record_motion_progress_baseline(self) -> None:
+        """Reset the motion_progress baseline to the current pose and time."""
+        self._motion_progress_pose = self.last_pose
+        self._motion_progress_at = time.monotonic()
+
+    def _check_motion_progress(self) -> None:
+        """Advance the motion_progress baseline if the pose moved beyond the configured delta.
+
+        Called every cycle the active command is RUNNING. Only a real
+        position/yaw change counts as progress; observing RUNNING alone does
+        not (Issue #34 Plan §7.2).
+        """
+        if self._motion_progress_pose is None:
+            self._record_motion_progress_baseline()
+            return
+        if not self._is_near_target(
+                self._motion_progress_pose.x,
+                self._motion_progress_pose.y,
+                self._motion_progress_pose.theta,
+                distance_tolerance=self.progress_distance_delta,
+                yaw_tolerance=self.progress_yaw_delta,
+        ):
+            self._record_motion_progress_baseline()
+
+    def _command_start_timeout_expired(self) -> bool:
+        """Return True when RUNNING has not been observed within command_start_timeout."""
+        if self.command_dispatched_at is None:
+            return False
+        return (time.monotonic() - self.command_dispatched_at) >= self.command_start_timeout
+
+    def _motion_progress_timeout_expired(self) -> bool:
+        """Return True when the pose has not moved within motion_progress_timeout while RUNNING."""
+        if self._motion_progress_at is None:
+            return False
+        return (time.monotonic() - self._motion_progress_at) >= self.motion_progress_timeout
+
+    def _attempt_cancel_active_command(self) -> None:
+        """Best-effort cancel of the active Kachaka command on a start/progress timeout."""
+        try:
+            if hasattr(self.kachaka_client, 'cancel_command'):
+                self.kachaka_client.cancel_command()
+        except Exception as e:
+            self._log_error('Unexpected', '_attempt_cancel_active_command', e)
+
+    def _handle_async_timeout(self, error_code: int, reason: str) -> None:
+        """Cancel and fail-once the active async command on a start/progress timeout."""
+        task_id = self.task_id
+        if not task_id:
+            return
+        self._log_error_msg(f'{reason} for task {task_id}; attempting cancel and failing once')
+        self._attempt_cancel_active_command()
+        self._publish_command_completion(success=False, error_code=error_code, task_id=task_id, reason=reason)
+
+    def _validate_command_match(self, last_result: Dict[str, Any]) -> tuple:
+        """Confirm a Kachaka success result matches the command that was dispatched.
+
+        A matching command_id is not sufficient: the Kachaka command type,
+        current floor, and (when applicable) target position/yaw must also
+        match, so a same-ID-but-different-command success is never reported
+        as the active RMF instruction's success (Issue #34 Plan §7.3).
+
+        Returns:
+            (matched, reason): matched is False when the result should not be
+                treated as success; reason is the Plan §5.2 reason string to
+                publish, or None when no listed reason applies.
+        """
+        expected_field = self.COMMAND_TYPE_FIELD.get(self.expected_kachaka_method or '')
+        if expected_field is None:
+            return True, None
+
+        command_dict = last_result.get('command')
+        if not isinstance(command_dict, dict) or expected_field not in command_dict:
+            self._log_warning(
+                f'Command type mismatch for task {self.task_id}: expected {expected_field}, got {command_dict!r}')
+            return False, None
+
+        if (self.command_target_map_name is not None and
+                self.command_target_map_name != self.map_state.telemetry_map_name):
+            self._log_warning(f'Floor mismatch at completion for task {self.task_id}: expected '
+                              f'{self.command_target_map_name}, robot is on {self.map_state.telemetry_map_name}')
+            return False, 'map_mismatch'
+
+        if self.command_target_pose is not None and not self._is_near_target(
+                self.command_target_pose.x,
+                self.command_target_pose.y,
+                self.command_target_pose.theta,
+                distance_tolerance=self.command_match_distance_tolerance,
+                yaw_tolerance=self.command_match_yaw_tolerance,
+        ):
+            self._log_warning(f'Target position mismatch at completion for task {self.task_id}: '
+                              f'target={self.command_target_pose.as_list()}, last_pose={self.last_pose.as_list()}')
+            return False, None
+
+        return True, None
+
+    def _is_own_return_home(self, observed_command_id: Optional[str]) -> bool:
+        """Return True when a RUNNING returnHomeCommand belongs to our own dispatched dock.
+
+        RMF issues return_home via the 'dock' RMF method (mapped to Kachaka's
+        return_home). Before the command_id has been bound (early in the
+        dispatch), the observed id cannot yet be compared, so any RUNNING
+        return_home while our own dock task is in flight is treated as ours
+        (Issue #34 Plan §7.4).
+        """
+        if self.task_id is None or self.last_command is None:
+            return False
+        if self.last_command.get('method') != 'dock':
+            return False
+        return self.current_command_id is None or self.current_command_id == observed_command_id
+
+    def _handle_external_return_home_started(self, command_id: Optional[str]) -> None:
+        """Preempt any active RMF task and mark external control as active."""
+        preempted_task_id = self.task_id
+        if preempted_task_id is not None:
+            self._log_error_msg(f'External returnHome (command_id={command_id}) observed; '
+                                f'preempting active RMF task {preempted_task_id}')
+            self._publish_command_completion(success=False,
+                                             error_code=-8,
+                                             task_id=preempted_task_id,
+                                             reason='external_preempted')
+        else:
+            self._log_info(f'External returnHome (command_id={command_id}) observed while idle')
+        self.external_control_active = True
+        self._external_command_id = command_id
+
+    def _handle_external_return_home_ended(self) -> None:
+        """Mark external control as no longer active."""
+        self._log_info(f'External returnHome (command_id={self._external_command_id}) ended')
+        self.external_control_active = False
+        self._external_command_id = None
+
+    async def monitor_external_control(self) -> None:
+        """Detect Kachaka commands not issued by this bridge (Issue #34 Plan §7.4).
+
+        Runs every main loop iteration regardless of whether an RMF task is
+        active, so an externally-triggered returnHome (e.g. from the Kachaka
+        app or a low-battery auto-return) is observed even while idle.
+        """
+        method_name = 'monitor_external_control'
+        try:
+            state_res = self._get_command_state_response()
+        except RpcError:
+            return  # Already logged by _get_command_state_response.
+        except Exception as e:
+            self._log_error('Unexpected', method_name, e)
+            return
+
+        with self._command_lock:
+            command_dict = state_res.get('command')
+            is_return_home = isinstance(command_dict, dict) and 'returnHomeCommand' in command_dict
+            is_running = self._is_running_state(state_res.get('state'))
+            observed_id = state_res.get('commandId')
+
+            is_external_now = (is_return_home and is_running and observed_id is not None and
+                               not self._is_own_return_home(observed_id))
+
+            if is_external_now and not self.external_control_active:
+                self._handle_external_return_home_started(observed_id)
+            elif not is_external_now and self.external_control_active:
+                self._handle_external_return_home_ended()
+
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
 
@@ -523,6 +773,55 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
+    async def publish_state(self) -> None:
+        """Publish the unified robot state payload to Zenoh (Issue #34 Plan §5.1).
+
+        Kachaka has no API that returns floor and position atomically, so this
+        reads floor -> pose -> floor and only publishes when both floor reads
+        agree; a switch_map racing this read is caught by the mismatch and the
+        sample is discarded rather than published with a stale floor/pose
+        combination. On any gRPC error the sample is discarded outright: an
+        old pose must never be resent under a new timestamp.
+        """
+        method_name = 'publish_state'
+        try:
+            map_name_before = self._fetch_robot_map_name(self.grpc_telemetry_timeout)
+            pose_response = self.kachaka_client.stub.GetRobotPose(pb2.GetRequest(),
+                                                                  timeout=self.grpc_telemetry_timeout)
+            pose = Pose(pose_response.pose.x, pose_response.pose.y, pose_response.pose.theta)
+            map_name_after = self._fetch_robot_map_name(self.grpc_telemetry_timeout)
+
+            if map_name_before != map_name_after:
+                self.logger.info(
+                    'Discarding state sample: map changed during read (%s -> %s), likely switch_map in progress',
+                    map_name_before,
+                    map_name_after,
+                )
+                return
+
+            with self._command_lock:
+                self._state_seq += 1
+                seq = self._state_seq
+                external_control_active = self.external_control_active
+
+            state_payload = {
+                'schema_version': 1,
+                'seq': seq,
+                'stamp': time.time(),
+                'map_name': map_name_after,
+                'pose': pose.as_list(),
+                'external_control_active': external_control_active,
+            }
+            self._publish_to_zenoh(self.state_pub, state_payload)
+            self.logger.debug(f'Published state seq={seq} map_name={map_name_after}')
+        except RpcError as e:
+            if e.code() == StatusCode.DEADLINE_EXCEEDED:
+                self.logger.warning(f'Timeout in {method_name}; discarding sample (no stale resend)')
+            else:
+                self._log_error('RPC', method_name, e)
+        except Exception as e:
+            self._log_error('Unexpected', method_name, e)
+
     async def _handle_command_retry(self, task_id: str, error_code: int) -> bool:
         """Handle retry logic for failed commands.
 
@@ -604,6 +903,10 @@ class KachakaApiClientByZenoh:
                 command_id = state_res.get('commandId')
                 state_value = state_res.get('state')
 
+                if self.is_async_command and not self.saw_running and self._command_start_timeout_expired():
+                    self._handle_async_timeout(error_code=-6, reason='start_timeout')
+                    return
+
                 if self.is_async_command:
                     if command_id:
                         if self.current_command_id is None and self._is_running_state(state_value):
@@ -624,6 +927,10 @@ class KachakaApiClientByZenoh:
                     self.saw_running = True
                     self.last_progress_at = time.monotonic()
                     self._ignored_result_count = 0
+                    self._check_motion_progress()
+                    if self._motion_progress_timeout_expired():
+                        self._handle_async_timeout(error_code=-7, reason='progress_timeout')
+                        return
                     result = CommandCompletion(
                         task_id=self.task_id,
                         is_completed=False,
@@ -673,11 +980,19 @@ class KachakaApiClientByZenoh:
                 else:
                     success = cmd_result.get('success', False)
                     error_code = cmd_result.get('errorCode', 0)
+                    reason = None
+                    if success and self.is_async_command:
+                        matched, mismatch_reason = self._validate_command_match(last_result)
+                        if not matched:
+                            success = False
+                            error_code = -2 if mismatch_reason == 'map_mismatch' else -1
+                            reason = mismatch_reason
                     result = CommandCompletion(
                         task_id=self.task_id,
                         is_completed=True,
                         success=success,
                         error_code=error_code,
+                        reason=reason,
                     )
 
                     if success:
@@ -943,7 +1258,7 @@ class KachakaApiClientByZenoh:
             self._log_error('RPC', '_verify_map_for_navigation', e)
             self._log_warning(
                 f'Could not verify current map for navigation to {requested_map_name}. Rejecting navigation command.')
-            self._publish_command_completion(success=False, error_code=-2, task_id=task_id)
+            self._publish_command_completion(success=False, error_code=-2, task_id=task_id, reason='map_mismatch')
             return False
 
         self.map_state = self.map_state.with_telemetry_map_name(current_map_name)
@@ -959,7 +1274,7 @@ class KachakaApiClientByZenoh:
         self._log_warning(f'Map name mismatch: requested={requested_map_name}, '
                           f'current={current_map_name}. '
                           f'Rejecting navigation command to prevent navigation to wrong floor coordinates.')
-        self._publish_command_completion(success=False, error_code=-2, task_id=task_id)
+        self._publish_command_completion(success=False, error_code=-2, task_id=task_id, reason='map_mismatch')
         return False
 
     def _execute_command(self, command: Dict[str, Any], expected_task_id: Optional[str] = None) -> None:
@@ -993,6 +1308,14 @@ class KachakaApiClientByZenoh:
                     new_task_id = command.get('id', None) if isinstance(command, dict) else None
                     if not isinstance(command, dict) or not all(k in command for k in ('method', 'args')):
                         raise ValueError('Invalid command structure')
+                    if self.external_control_active:
+                        self._log_warning(
+                            f'External control active; rejecting RMF command {new_task_id} with external_busy')
+                        self._publish_command_completion(success=False,
+                                                         error_code=-9,
+                                                         task_id=new_task_id,
+                                                         reason='external_busy')
+                        return
                     if expected_task_id is not None and self.task_id != expected_task_id:
                         self.logger.debug('Skip dispatch for stale task %s (active task: %s)', expected_task_id,
                                           self.task_id)
@@ -1028,6 +1351,12 @@ class KachakaApiClientByZenoh:
                     self.saw_running = False
                     self.async_command_started_at = None
                     self.last_progress_at = time.monotonic()
+                    self.command_dispatched_at = time.monotonic()
+                    self._motion_progress_pose = None
+                    self._motion_progress_at = None
+                    self.expected_kachaka_method = None
+                    self.command_target_map_name = None
+                    self.command_target_pose = None
                     self._ignored_result_count = 0
                     if not is_retry:
                         self.retry_count = 0
@@ -1042,6 +1371,24 @@ class KachakaApiClientByZenoh:
                         map_name = args.pop('map_name', None)
                         if map_name is not None and not self._verify_map_for_navigation(map_name, new_task_id):
                             return
+                        target_x = args.get('x')
+                        target_y = args.get('y')
+                        target_yaw = args.get('yaw', 0.0)
+                        if (target_x is not None and target_y is not None and self._is_near_target(
+                                target_x,
+                                target_y,
+                                target_yaw,
+                                distance_tolerance=self.noop_distance_tolerance,
+                                yaw_tolerance=self.noop_yaw_tolerance,
+                        )):
+                            self._log_info(
+                                f'Target within noop tolerance (distance<={self.noop_distance_tolerance}m, '
+                                f'yaw<={self.noop_yaw_tolerance}rad); reporting success without calling Kachaka')
+                            self._publish_command_completion(success=True, error_code=0, task_id=new_task_id)
+                            return
+                        self.expected_kachaka_method = 'move_to_pose'
+                        self.command_target_map_name = map_name
+                        self.command_target_pose = Pose(target_x or 0.0, target_y or 0.0, target_yaw or 0.0)
                         args = self._prepare_async_command_args(args, {'cancel_all': True})
                         self.logger.debug(f'Current pose: {self.last_pose.as_list()}')
                         self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
@@ -1049,6 +1396,7 @@ class KachakaApiClientByZenoh:
                         if self.is_async_command:
                             self._update_current_command_id(response, method_name)
                     elif method_name == 'return_home':
+                        self.expected_kachaka_method = 'return_home'
                         args = self._prepare_async_command_args(command['args'])
                         response = self._execute_sync_method(method_name, args, task_id=new_task_id)
                         if self.is_async_command:
@@ -1305,6 +1653,12 @@ class KachakaApiClientByZenoh:
         self.async_command_started_at = None
         self.last_progress_at = None
         self._ignored_result_count = 0
+        self.command_dispatched_at = None
+        self._motion_progress_pose = None
+        self._motion_progress_at = None
+        self.expected_kachaka_method = None
+        self.command_target_map_name = None
+        self.command_target_pose = None
 
     def _reconstruct_kachaka_client(self) -> bool:
         """Recreate the KachakaApiClient to recover from a dead gRPC channel.
@@ -1331,7 +1685,13 @@ class KachakaApiClientByZenoh:
                 self._log_error('Unexpected', '_reconstruct_kachaka_client', e)
                 return False
 
-    def _publish_command_completion(self, success: bool, error_code: int, task_id: Optional[str] = None) -> bool:
+    def _publish_command_completion(
+        self,
+        success: bool,
+        error_code: int,
+        task_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
         """Publish command completion status to Zenoh.
 
         Idempotent per task: when a completion for the same task ID was
@@ -1346,6 +1706,9 @@ class KachakaApiClientByZenoh:
             error_code (int): The error code (0 if success)
             task_id (str, optional): Explicit task ID to publish for.
                 Defaults to the active task.
+            reason (str, optional): Issue #34 Plan §5.2 completion reason
+                (e.g. 'start_timeout', 'external_preempted'). Omitted from
+                the payload when None.
         """
         with self._command_lock:
             target_task_id = task_id if task_id is not None else self.task_id
@@ -1362,6 +1725,7 @@ class KachakaApiClientByZenoh:
                 is_completed=True,
                 success=success,
                 error_code=error_code,
+                reason=reason,
             )
 
             self.last_command_result = completion_result
@@ -1477,6 +1841,8 @@ def main() -> None:
                     node.publish_pose,
                     node.publish_battery,
                     node.publish_map_name,
+                    node.monitor_external_control,
+                    node.publish_state,
                     node.publish_result,
                 ]
                 any_success = False

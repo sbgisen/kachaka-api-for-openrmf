@@ -622,7 +622,7 @@ class KachakaApiClientByZenoh:
             return True, None
 
         command_dict = last_result.get('command')
-        if not isinstance(command_dict, dict) or expected_field not in command_dict:
+        if not self._observed_command_type_matches_expected(command_dict):
             self._log_warning(
                 f'Command type mismatch for task {self.task_id}: expected {expected_field}, got {command_dict!r}')
             return False, None
@@ -933,12 +933,25 @@ class KachakaApiClientByZenoh:
                 self.logger.debug(f'GetCommandState response: {state_res}')
                 command_id = state_res.get('commandId')
                 state_value = state_res.get('state')
+                command_dict = state_res.get('command') if isinstance(state_res, dict) else None
 
                 if self.is_async_command and not self.saw_running and self._command_start_timeout_expired():
                     self._handle_async_timeout(error_code=-6, reason='start_timeout')
                     return
 
                 if self.is_async_command:
+                    if (self.current_command_id is None and self._is_running_state(state_value) and
+                            not self._observed_command_type_matches_expected(command_dict)):
+                        # A RUNNING command of the wrong type must never be bound to
+                        # this task, even before any command_id has been bound
+                        # (Issue #34 Plan §7.3, Codex review ISS34-006 blocking finding).
+                        self.logger.debug(
+                            'Ignoring RUNNING command_id %s for task %s: type mismatch (expected %s)',
+                            command_id,
+                            self.task_id,
+                            self.expected_kachaka_method,
+                        )
+                        return
                     if command_id:
                         if self.current_command_id is None and self._is_running_state(state_value):
                             self.current_command_id = command_id
@@ -973,7 +986,8 @@ class KachakaApiClientByZenoh:
                     return
 
                 if self.is_async_command and not self.saw_running:
-                    if self.current_command_id is None and command_id and self._running_state_wait_expired():
+                    if (self.current_command_id is None and command_id and self._running_state_wait_expired() and
+                            self._observed_command_type_matches_expected(command_dict)):
                         self.current_command_id = command_id
                         self._log_warning(f'RUNNING state was not observed within {self.running_state_wait}s; '
                                           f'falling back to command_id={command_id} for task {self.task_id}')
@@ -986,8 +1000,14 @@ class KachakaApiClientByZenoh:
                 self._first_grpc_failure_time = None
                 self.logger.debug(f'GetLastCommandResult response: {last_result}')
                 result_command_id = last_result.get('commandId')
+                result_command_dict = last_result.get('command') if isinstance(last_result, dict) else None
 
                 if self.is_async_command:
+                    if (self.current_command_id is None and self.saw_running and result_command_id and
+                            not self._observed_command_type_matches_expected(result_command_dict)):
+                        self._log_warning(f'Ignoring result command_id {result_command_id} for task {self.task_id}: '
+                                          f'type mismatch (expected {self.expected_kachaka_method})')
+                        return
                     if result_command_id:
                         if self.current_command_id is None and self.saw_running:
                             self.current_command_id = result_command_id

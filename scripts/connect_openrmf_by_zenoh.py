@@ -1496,14 +1496,10 @@ class KachakaApiClientByZenoh:
                         self.command_target_pose = Pose(target_x or 0.0, target_y or 0.0, target_yaw or 0.0)
                         self.logger.debug(f'Current pose: {self.last_pose.as_list()}')
                         self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
-                        response = self._execute_async_stub_dispatch(method_name, args, task_id=new_task_id)
-                        if self.is_async_command:
-                            self._update_current_command_id(response, method_name)
+                        self._execute_async_stub_dispatch(method_name, args, task_id=new_task_id)
                     elif method_name == 'return_home':
                         self.expected_kachaka_method = 'return_home'
-                        response = self._execute_async_stub_dispatch(method_name, command['args'], task_id=new_task_id)
-                        if self.is_async_command:
-                            self._update_current_command_id(response, method_name)
+                        self._execute_async_stub_dispatch(method_name, command['args'], task_id=new_task_id)
                     else:
                         self.logger.debug(f'{method_name} args: {command["args"]}')
                         self._execute_sync_method(method_name, command['args'], task_id=new_task_id)
@@ -1751,10 +1747,19 @@ class KachakaApiClientByZenoh:
                 # slow grpc_connection_check above does not eat into the
                 # budget before the command was actually sent (Issue #34
                 # Plan §7.2, Codex review ISS34-006 non-blocking finding).
+                #
+                # command_dispatched_at/async_command_started_at and
+                # current_command_id are bound inside the same _command_lock
+                # acquisition so monitor_external_control() (a different
+                # thread) can never observe dispatched_at set while
+                # current_command_id is still unbound -- that gap let a
+                # racing own returnHome be misclassified as external and
+                # preempted (Codex re-review ISS34-016 blocking-1).
                 now = time.monotonic()
-                self.async_command_started_at = now
                 with self._command_lock:
+                    self.async_command_started_at = now
                     self.command_dispatched_at = now
+                    self._update_current_command_id(response_dict, method_name)
                 self.logger.info(f'Async command {method_name} started')
             else:
                 self._log_warning(f'Command {method_name} failed with error_code={error_code}')

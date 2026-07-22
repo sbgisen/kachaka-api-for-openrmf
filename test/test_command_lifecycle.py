@@ -1010,6 +1010,83 @@ def test_external_return_home_when_own_dispatch_never_bound_id_is_detected_as_ex
     assert node.external_control_active is True
 
 
+def test_start_command_success_and_id_bind_are_atomic_under_concurrent_monitor() -> None:
+    """command_dispatched_at/current_command_id must never be observably split across threads.
+
+    Reproduces Codex re-review ISS34-016 blocking-1: _execute_async_stub_dispatch
+    previously set command_dispatched_at/async_command_started_at under
+    _command_lock, but current_command_id was bound afterwards by the caller
+    (_execute_command), outside any lock. A real monitor_external_control()
+    call running on a different thread in that gap saw command_dispatched_at
+    already set but current_command_id still unbound, misclassified our own
+    dispatched dock (return_home) as an external returnHome, and preempted
+    the in-flight task with external_preempted. The fix binds
+    command_dispatched_at/async_command_started_at/current_command_id inside
+    a single _command_lock acquisition in _execute_async_stub_dispatch, so
+    monitor_external_control() can never observe the split state -- it
+    either runs before dispatch starts or blocks on _command_lock until the
+    whole bundle is bound.
+
+    Drives command dispatch (_execute_command) and detection
+    (monitor_external_control) on real threads through their real code
+    paths; only _update_current_command_id is wrapped, purely to pin the
+    interleaving at the exact point being fixed.
+    """
+    node = make_node(client_methods=['return_home', 'stub'])
+    node.method_mapping = {'dock': 'return_home'}
+    node.grpc_connection_check = MagicMock(return_value=True)
+    node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response(
+        command_id='own-dock-race-1'))
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'own-dock-race-1',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+
+    reached_bind_point = threading.Event()
+    proceed_to_bind = threading.Event()
+    original_update = node._update_current_command_id
+
+    def racing_update(response: Optional[dict], method_name: str) -> None:
+        reached_bind_point.set()
+        proceed_to_bind.wait(timeout=2.0)
+        original_update(response, method_name)
+
+    node._update_current_command_id = racing_update
+
+    dispatch_thread = threading.Thread(
+        target=node._execute_command,
+        args=({
+            'id': 'cmd-dock-race',
+            'method': 'dock',
+            'args': {}
+        },),
+    )
+    dispatch_thread.start()
+    assert reached_bind_point.wait(timeout=2.0), 'dispatch never reached the id-bind point'
+
+    monitor_thread = threading.Thread(target=lambda: asyncio.run(node.monitor_external_control()))
+    monitor_thread.start()
+    # Grace period for the monitor to attempt _command_lock: enough for it to
+    # either finish (pre-fix: lock is free, the bug reproduces almost
+    # instantly) or still be blocked on it (post-fix: dispatch holds the
+    # lock through the whole bind).
+    time.sleep(0.1)
+    proceed_to_bind.set()
+
+    monitor_thread.join(timeout=2.0)
+    dispatch_thread.join(timeout=2.0)
+    assert not monitor_thread.is_alive()
+    assert not dispatch_thread.is_alive()
+
+    assert published_payloads(node) == []
+    assert node.external_control_active is False
+    assert node.task_id == 'cmd-dock-race'
+    assert node.current_command_id == 'own-dock-race-1'
+
+
 def test_recently_completed_dock_return_home_is_not_treated_as_external() -> None:
     """A dock that just completed is not mistaken for external control (concern (b)).
 

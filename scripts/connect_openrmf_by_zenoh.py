@@ -698,25 +698,24 @@ class KachakaApiClientByZenoh:
         """Return True when a RUNNING returnHomeCommand belongs to our own dispatched dock.
 
         RMF issues return_home via the 'dock' RMF method (mapped to Kachaka's
-        return_home). Once current_command_id has been bound, ownership is
-        decided purely by ID equality. Before it is bound, the observed id
-        cannot yet be compared; an unbound id is treated as plausibly ours
-        only within running_state_wait of our own dispatch (the window in
-        which our own RUNNING is expected to appear) -- not indefinitely, so
-        a genuinely external returnHome that starts before ours binds is
-        eventually recognized as external instead of being assumed ours
-        forever (Issue #34 Plan §7.4, Codex review ISS34-006 blocking
-        finding). A dock that completed just before this poll is still
-        recognized via the short-lived _recently_own_return_home_* grace
-        period (concern (b)), so the trailing RUNNING state Kachaka can
-        report right after completion is not mistaken for external control.
+        return_home). Ownership is decided purely by command_id equality:
+        move_to_pose/return_home dispatch captures command_id synchronously
+        via stub.StartCommand() (see _execute_async_stub_dispatch), so
+        current_command_id is bound before this is ever consulted. An unbound
+        current_command_id is therefore treated as not ours -- never as
+        plausibly ours within a grace window -- so a genuinely external
+        returnHome racing our own dispatch is recognized as external instead
+        of being assumed ours (Issue #34 Plan §7.4, Codex re-review ISS34-010
+        blocking-3: the previous running_state_wait-window fallback assumed
+        an unbound id was ours, which misclassified an external returnHome
+        arriving in that window as our own). A dock that completed just
+        before this poll is still recognized via the short-lived
+        _recently_own_return_home_* grace period (concern (b)), so the
+        trailing RUNNING state Kachaka can report right after completion is
+        not mistaken for external control.
         """
         if self.task_id is not None and self.last_command is not None and self.last_command.get('method') == 'dock':
-            if self.current_command_id is not None:
-                return self.current_command_id == observed_command_id
-            if self.command_dispatched_at is None:
-                return False
-            return (time.monotonic() - self.command_dispatched_at) < self.running_state_wait
+            return self.current_command_id is not None and self.current_command_id == observed_command_id
 
         if (self._recently_own_return_home_id is not None and
                 observed_command_id == self._recently_own_return_home_id and
@@ -1312,30 +1311,6 @@ class KachakaApiClientByZenoh:
             # Wait before next check
             await asyncio.sleep(self.command_check_interval)
 
-    def _prepare_async_command_args(self,
-                                    args: Dict[str, Any],
-                                    defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Prepare arguments for async StartCommand methods.
-
-        Sets wait_for_completion=False by default and updates is_async_command flag.
-
-        Args:
-            args: Original command arguments
-            defaults: Additional default values to set if not present
-
-        Returns:
-            Prepared arguments dict
-        """
-        prepared = args.copy() if args else {}
-        if defaults:
-            for key, value in defaults.items():
-                if key not in prepared:
-                    prepared[key] = value
-        if 'wait_for_completion' not in prepared:
-            prepared['wait_for_completion'] = False
-        self.is_async_command = not prepared.get('wait_for_completion', True)
-        return prepared
-
     def _complete_superseded_task(self, new_task_id: Optional[str]) -> None:
         """Mark the current active task as superseded before accepting a new one."""
         if not self.task_id or self.task_id == new_task_id:
@@ -1469,11 +1444,12 @@ class KachakaApiClientByZenoh:
                     self.saw_running = False
                     self.async_command_started_at = None
                     self.last_progress_at = time.monotonic()
-                    # Set to the actual dispatch-success time in _execute_sync_method,
-                    # not here: grpc_connection_check can stall before the real send,
-                    # which would otherwise eat into the command_start budget before
-                    # the command was even sent (Issue #34 Plan §7.2, Codex review
-                    # ISS34-006 non-blocking finding).
+                    # Set to the actual dispatch-success time in
+                    # _execute_async_stub_dispatch/_execute_sync_method, not
+                    # here: grpc_connection_check can stall before the real
+                    # send, which would otherwise eat into the command_start
+                    # budget before the command was even sent (Issue #34 Plan
+                    # §7.2, Codex review ISS34-006 non-blocking finding).
                     self.command_dispatched_at = None
                     self._motion_progress_pose = None
                     self._motion_progress_at = None
@@ -1518,16 +1494,14 @@ class KachakaApiClientByZenoh:
                         self.expected_kachaka_method = 'move_to_pose'
                         self.command_target_map_name = map_name
                         self.command_target_pose = Pose(target_x or 0.0, target_y or 0.0, target_yaw or 0.0)
-                        args = self._prepare_async_command_args(args, {'cancel_all': True})
                         self.logger.debug(f'Current pose: {self.last_pose.as_list()}')
                         self.logger.debug(f'Target pose: x={args.get("x")}, y={args.get("y")}, yaw={args.get("yaw")}')
-                        response = self._execute_sync_method(method_name, args, task_id=new_task_id)
+                        response = self._execute_async_stub_dispatch(method_name, args, task_id=new_task_id)
                         if self.is_async_command:
                             self._update_current_command_id(response, method_name)
                     elif method_name == 'return_home':
                         self.expected_kachaka_method = 'return_home'
-                        args = self._prepare_async_command_args(command['args'])
-                        response = self._execute_sync_method(method_name, args, task_id=new_task_id)
+                        response = self._execute_async_stub_dispatch(method_name, command['args'], task_id=new_task_id)
                         if self.is_async_command:
                             self._update_current_command_id(response, method_name)
                     else:
@@ -1698,6 +1672,104 @@ class KachakaApiClientByZenoh:
         if 'success' in response or 'errorCode' in response:
             return response
         return None
+
+    def _build_stub_start_command_request(self, method_name: str, args: Dict[str, Any]) -> pb2.StartCommandRequest:
+        """Build the StartCommandRequest for a stub-direct async dispatch.
+
+        Mirrors the pb2.Command the installed kachaka_api library's
+        move_to_pose()/return_home() wrappers build internally (see
+        kachaka_api/base.py), so calling stub.StartCommand() with this
+        request has the same effect on the robot as going through the
+        wrapper -- except the response keeps command_id, which the wrapper
+        discards (Issue #34 Plan §7.3/§7.4, Codex re-review ISS34-010
+        blocking-3).
+        """
+        if method_name == 'move_to_pose':
+            command = pb2.Command(move_to_pose_command=pb2.MoveToPoseCommand(
+                x=args.get('x', 0.0),
+                y=args.get('y', 0.0),
+                yaw=args.get('yaw', 0.0),
+            ))
+        elif method_name == 'return_home':
+            command = pb2.Command(return_home_command=pb2.ReturnHomeCommand())
+        else:
+            raise ValueError(f'Unsupported stub dispatch method: {method_name}')
+        return pb2.StartCommandRequest(command=command, cancel_all=args.get('cancel_all', True))
+
+    def _execute_async_stub_dispatch(
+        self,
+        method_name: str,
+        args: Dict[str, Any],
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch move_to_pose/return_home via stub.StartCommand() directly.
+
+        The installed kachaka_api library's move_to_pose()/return_home()
+        wrappers call start_command(), which discards
+        StartCommandResponse.command_id whenever wait_for_completion is
+        False (the mode this bridge always uses): ``if not
+        response.result.success or not wait_for_completion: return
+        response.result``. Calling stub.StartCommand() directly instead
+        keeps command_id, so bind (§7.3) and ownership (§7.4) judgments can
+        key off ID equality from dispatch onward. This path replaces
+        _execute_sync_method for move_to_pose/return_home only; every other
+        method_mapping-driven method still goes through the generic wrapper
+        dispatch there (Issue #34 Plan §7.3/§7.4, Codex re-review ISS34-010
+        blocking-3).
+
+        Args:
+            method_name (str): 'move_to_pose' or 'return_home'.
+            args (Dict[str, Any]): The command arguments (x/y/yaw for
+                move_to_pose; cancel_all applies to both, defaulting to True).
+            task_id (str, optional): The ID of the command being executed.
+                Completions are published for this ID so they can never be
+                attributed to a different (newer) task.
+
+        Returns:
+            Dict[str, Any]: {'result': {...}, 'commandId': ...} shaped like
+            _to_dict(StartCommandResponse), so _update_current_command_id
+            and the existing async-started bookkeeping apply unchanged.
+        """
+        self.is_async_command = True
+        try:
+            if not self.grpc_connection_check(max_retries=self.command_max_retries):
+                error_msg = f'Failed to connect to Kachaka API server for method {method_name}'
+                self.logger.error(error_msg)
+                self._publish_command_completion(success=False, error_code=-1, task_id=task_id)
+                raise ConnectionError(error_msg)
+
+            request = self._build_stub_start_command_request(method_name, args)
+            response_dict = self._to_dict(self.kachaka_client.stub.StartCommand(request))
+
+            result_dict = response_dict.get('result', {}) if isinstance(response_dict, dict) else {}
+            success = result_dict.get('success', False)
+            error_code = result_dict.get('errorCode', 0)
+
+            if success:
+                # Origin of the command_start timeout is dispatch success
+                # (here), not command acceptance in _execute_command, so a
+                # slow grpc_connection_check above does not eat into the
+                # budget before the command was actually sent (Issue #34
+                # Plan §7.2, Codex review ISS34-006 non-blocking finding).
+                now = time.monotonic()
+                self.async_command_started_at = now
+                with self._command_lock:
+                    self.command_dispatched_at = now
+                self.logger.info(f'Async command {method_name} started')
+            else:
+                self._log_warning(f'Command {method_name} failed with error_code={error_code}')
+                self._publish_command_completion(success=False, error_code=error_code, task_id=task_id)
+
+            return response_dict
+
+        except RpcError as e:
+            self.logger.error(f'RPC error in {method_name}: {e.details()}')
+            self._publish_command_completion(success=False, error_code=-1, task_id=task_id)
+            raise
+        except Exception as e:
+            self.logger.error(f'Unexpected error in {method_name}: {str(e)}')
+            self._publish_command_completion(success=False, error_code=-1, task_id=task_id)
+            raise
 
     def _execute_sync_method(
         self,

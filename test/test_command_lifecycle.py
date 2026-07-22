@@ -107,6 +107,7 @@ def make_node(client_methods: list = []) -> KachakaApiClientByZenoh:
     node.kachaka_client = MagicMock(spec=client_methods)
     # Issue #34 Step 2 state: near-distance short-circuit, split timeouts,
     # command matching, external returnHome tracking, unified state seq.
+    node.noop_enabled = False
     node.noop_distance_tolerance = 0.15
     node.noop_yaw_tolerance = 0.10
     node.progress_distance_delta = 0.02
@@ -306,6 +307,7 @@ def test_stale_completion_does_not_reset_active_task() -> None:
 def test_move_to_pose_short_circuits_within_noop_tolerance() -> None:
     """A 14.9cm move within yaw tolerance succeeds once without calling Kachaka."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_sync_method = MagicMock()
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
@@ -333,6 +335,7 @@ def test_move_to_pose_short_circuits_within_noop_tolerance() -> None:
 def test_move_to_pose_short_circuits_across_pi_seam() -> None:
     """Yaw tolerance is checked after normalizing across the +/-pi wraparound."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_sync_method = MagicMock()
     node.last_pose = Pose(0.0, 0.0, 3.10)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
@@ -356,6 +359,7 @@ def test_move_to_pose_short_circuits_across_pi_seam() -> None:
 def test_move_to_pose_does_not_short_circuit_without_map_name() -> None:
     """A missing map_name never short-circuits, even at zero distance (Plan §7.1)."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-nomap'})
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node._fetch_robot_map_name = MagicMock(return_value='8F')
@@ -379,6 +383,7 @@ def test_move_to_pose_does_not_short_circuit_without_map_name() -> None:
 def test_move_to_pose_short_circuit_requires_fresh_floor_match() -> None:
     """A stale cache match is not enough: a fresh floor mismatch dispatches instead of short-circuiting."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-stale'})
     node.last_pose = Pose(0.0, 0.0, 0.0)
     # Cache says 8F (matches the request) but the robot has actually switched to 9F
@@ -405,6 +410,7 @@ def test_move_to_pose_short_circuit_requires_fresh_floor_match() -> None:
 def test_move_to_pose_short_circuits_at_exact_boundary() -> None:
     """Exactly 0.15m / 0.10rad (the inclusive boundary) still short-circuits."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_async_stub_dispatch = MagicMock()
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
@@ -428,6 +434,7 @@ def test_move_to_pose_short_circuits_at_exact_boundary() -> None:
 def test_move_to_pose_dispatches_when_only_yaw_exceeds_tolerance() -> None:
     """Distance within tolerance but yaw beyond it dispatches a normal command."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-yaw'})
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
@@ -454,6 +461,7 @@ def test_move_to_pose_dispatches_when_only_yaw_exceeds_tolerance() -> None:
 def test_move_to_pose_dispatches_when_outside_noop_tolerance() -> None:
     """A move beyond the noop tolerance is dispatched to Kachaka as normal."""
     node = make_node(client_methods=['move_to_pose'])
+    node.noop_enabled = True
     node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-move'})
     node.last_pose = Pose(0.0, 0.0, 0.0)
     node.map_state = MapState.initial().with_telemetry_map_name('8F')
@@ -476,6 +484,37 @@ def test_move_to_pose_dispatches_when_outside_noop_tolerance() -> None:
     assert node.command_target_pose == Pose(1.0, 0.0, 0.0)
     # The noop short-circuit must not have published a completion itself;
     # _execute_async_stub_dispatch (mocked here) owns publishing for the dispatch path.
+    assert published_payloads(node) == []
+
+
+def test_move_to_pose_dispatches_when_noop_disabled_by_default() -> None:
+    """With noop_enabled left at its default (False), an in-tolerance move still dispatches normally."""
+    node = make_node(client_methods=['move_to_pose'])
+    node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-noop-disabled'})
+    node._is_near_target = MagicMock()
+    node._fresh_floor_matches = MagicMock()
+    node.last_pose = Pose(0.0, 0.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+
+    node._execute_command({
+        'id': 'cmd-noop-disabled',
+        'method': 'move_to_pose',
+        'args': {
+            'x': 0.0,
+            'y': 0.0,
+            'yaw': 0.0,
+            'map_name': '8F'
+        },
+    })
+
+    # noop_enabled=False must short-circuit-evaluate the gate before
+    # _is_near_target()/_fresh_floor_matches() are called at all.
+    node._is_near_target.assert_not_called()
+    node._fresh_floor_matches.assert_not_called()
+    node._execute_async_stub_dispatch.assert_called_once()
+    assert node._execute_async_stub_dispatch.call_args.kwargs['task_id'] == 'cmd-noop-disabled'
+    assert node.expected_kachaka_method == 'move_to_pose'
+    assert node.command_target_pose == Pose(0.0, 0.0, 0.0)
     assert published_payloads(node) == []
 
 

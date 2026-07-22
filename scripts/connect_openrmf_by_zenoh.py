@@ -156,6 +156,7 @@ class KachakaApiClientByZenoh:
     retry_on_error_types: List[str]
     retry_count: int
     state_pub: zenoh.Publisher
+    noop_enabled: bool
     noop_distance_tolerance: float
     noop_yaw_tolerance: float
     progress_distance_delta: float
@@ -236,6 +237,7 @@ class KachakaApiClientByZenoh:
         self.command_check_interval = intervals.get('command_check', 4.0)
 
         # Load navigation tolerance settings (Issue #34 Plan §7.1-§7.3)
+        self.noop_enabled = bool(navigation.get('noop_enabled', False))
         self.noop_distance_tolerance = float(navigation.get('noop_distance_tolerance', 0.15))
         self.noop_yaw_tolerance = float(navigation.get('noop_yaw_tolerance', 0.10))
         self.progress_distance_delta = float(navigation.get('progress_distance_delta', 0.02))
@@ -1478,8 +1480,8 @@ class KachakaApiClientByZenoh:
                         # since it is cheap; the fresh floor re-query only happens
                         # for candidates that are otherwise about to short-circuit
                         # (Issue #34 Plan §7.1, Codex review ISS34-006 concern (a)).
-                        if (map_name is not None and target_x is not None and target_y is not None and
-                                self._is_near_target(
+                        if (self.noop_enabled and map_name is not None and target_x is not None and
+                                target_y is not None and self._is_near_target(
                                     target_x,
                                     target_y,
                                     target_yaw,

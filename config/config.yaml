@@ -26,6 +26,8 @@ timeouts:
 
 # Navigation tolerances (distances in meters, angles in radians)
 navigation:
+  # Set to true to enable the near-target short-circuit below (default off, see PR #48).
+  noop_enabled: false
   # yamllint disable-line rule:line-length
   noop_distance_tolerance: 0.15          # Below this + yaw tolerance, skip Kachaka move_to_pose and report success directly
   noop_yaw_tolerance: 0.10

@@ -1426,7 +1426,12 @@ class KachakaApiClientByZenoh:
                     self.saw_running = False
                     self.async_command_started_at = None
                     self.last_progress_at = time.monotonic()
-                    self.command_dispatched_at = time.monotonic()
+                    # Set to the actual dispatch-success time in _execute_sync_method,
+                    # not here: grpc_connection_check can stall before the real send,
+                    # which would otherwise eat into the command_start budget before
+                    # the command was even sent (Issue #34 Plan §7.2, Codex review
+                    # ISS34-006 non-blocking finding).
+                    self.command_dispatched_at = None
                     self._motion_progress_pose = None
                     self._motion_progress_at = None
                     self.expected_kachaka_method = None
@@ -1693,7 +1698,15 @@ class KachakaApiClientByZenoh:
                     # Async command started, don't publish completion yet.
                     # publish_result polls GetCommandState/GetLastCommandResult
                     # and publishes completion after RUNNING state is seen.
-                    self.async_command_started_at = time.monotonic()
+                    now = time.monotonic()
+                    self.async_command_started_at = now
+                    # Origin of the command_start timeout is dispatch success
+                    # (here), not command acceptance in _execute_command, so a
+                    # slow grpc_connection_check above does not eat into the
+                    # budget before the command was actually sent (Issue #34
+                    # Plan §7.2, Codex review ISS34-006 non-blocking finding).
+                    with self._command_lock:
+                        self.command_dispatched_at = now
                     self.logger.info(f'Async command {method_name} started')
                 elif success:
                     self.logger.info(f'Command {method_name} completed successfully')

@@ -768,6 +768,14 @@ class KachakaApiClientByZenoh:
         within the dispatch window (and would therefore be invisible to any
         later live poll) is still detected rather than silently dropped
         (Codex re-review ISS34-037 non-blocking finding).
+
+        Callers must only invoke this after a dispatch that goes through
+        _execute_async_stub_dispatch() (move_to_pose/return_home): that is
+        the only path that can ever bind current_command_id, which
+        _is_own_command_id() needs to tell "our own in-flight command" apart
+        from a genuinely external one. A sync dispatch (switch_map, etc.)
+        never binds an id at all, so this would always misclassify its own
+        command as external (Codex re-review ISS34-040 blocking-B).
         """
         snapshot_id = self._pending_dispatch_snapshot_id
         self._pending_dispatch_snapshot_id = None
@@ -1088,7 +1096,16 @@ class KachakaApiClientByZenoh:
                             command_id,
                         )
                         return
-                    if command_id and command_id != self.current_command_id:
+                    if command_id != self.current_command_id:
+                        # A required exact match, not just a mismatch check
+                        # when both sides are non-empty: an empty/missing
+                        # commandId here must never be treated as "still
+                        # ours". Kachaka API 3.14.4.0's own client wrapper
+                        # requires result.command_id == response.command_id
+                        # while waiting for completion, so a genuinely
+                        # RUNNING/completed own command is expected to keep
+                        # reporting a non-empty id (Codex re-review
+                        # ISS34-040 blocking-A).
                         self._note_ignored_mismatch('command state', command_id)
                         return
 
@@ -1120,11 +1137,13 @@ class KachakaApiClientByZenoh:
                 self.logger.debug(f'GetLastCommandResult response: {last_result}')
                 result_command_id = last_result.get('commandId')
 
-                if self.is_async_command and result_command_id and result_command_id != self.current_command_id:
+                if self.is_async_command and result_command_id != self.current_command_id:
+                    # Required exact match, same as the state-side check
+                    # above: an empty/missing commandId on the result must
+                    # never be accepted as a completion for our bound
+                    # command (Codex re-review ISS34-040 blocking-A).
                     self._note_ignored_mismatch('result', result_command_id)
                     return
-                if self.is_async_command and not result_command_id:
-                    self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
 
                 cmd_result = last_result.get('result')
                 if not isinstance(cmd_result, dict):
@@ -1502,6 +1521,17 @@ class KachakaApiClientByZenoh:
                     if not is_retry:
                         self.retry_count = 0
                     self.dispatching = True
+                    # Only move_to_pose/return_home go through
+                    # _execute_async_stub_dispatch(), the sole path that can
+                    # ever bind current_command_id from a StartCommand
+                    # response. switch_map and other synchronous methods
+                    # never capture an ownership id at all -- even for their
+                    # own in-flight command -- so a RUNNING snapshot
+                    # observed while one of them dispatches can never be
+                    # confirmed as ours; reconciling it would always
+                    # misclassify the sync command's own id as external
+                    # (Codex re-review ISS34-040 blocking-B).
+                    is_async_dispatch = method_name in ('move_to_pose', 'return_home')
 
                 try:
                     # Heavy gRPC work: outside _command_lock, guarded by dispatching.
@@ -1548,7 +1578,17 @@ class KachakaApiClientByZenoh:
                 finally:
                     with self._command_lock:
                         self.dispatching = False
-                        self._reconcile_pending_dispatch_snapshot()
+                        if is_async_dispatch:
+                            self._reconcile_pending_dispatch_snapshot()
+                        else:
+                            # Discard rather than reconcile: a snapshot from
+                            # a sync dispatch's window has no own id to
+                            # compare against, so reconciling it here could
+                            # only ever misclassify our own command, and
+                            # carrying it over to a later, unrelated async
+                            # dispatch's reconciliation would be equally
+                            # wrong (Codex re-review ISS34-040 blocking-B).
+                            self._pending_dispatch_snapshot_id = None
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             self._log_error_msg(f'Invalid command: {str(e)}')
             if new_task_id:

@@ -740,6 +740,151 @@ def test_final_pose_mismatch_is_not_reported_as_success() -> None:
     assert published_payloads(node) == [{'id': 'cmd-pose', 'is_completed': True, 'success': False}]
 
 
+def test_bound_command_missing_state_command_id_is_not_treated_as_progress() -> None:
+    """A RUNNING GetCommandState response missing commandId must not be accepted as our bound command.
+
+    Codex re-review ISS34-040 blocking-A: publish_result() only rejected a
+    *non-empty* mismatched commandId on the state poll; an empty/missing one
+    slipped through unchecked and was treated as progress on the active
+    task. Kachaka API 3.14.4.0's own client wrapper requires
+    result.command_id == response.command_id while waiting for completion,
+    so an empty id here must fail closed the same as any other mismatch,
+    not be silently accepted.
+    """
+    node = make_node()
+    node.task_id = 'cmd-bound'
+    node.is_async_command = True
+    node.saw_running = False
+    node.current_command_id = 'own-id-1'
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_dispatched_at = time.monotonic()
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': None,
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'moveToPoseCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert node.saw_running is False
+    assert published_payloads(node) == []
+
+
+def test_bound_command_missing_result_command_id_does_not_report_success() -> None:
+    """A GetLastCommandResult response missing commandId must never be accepted as our completion.
+
+    Direct regression for Codex re-review ISS34-040 blocking-A: the
+    previous code only rejected a *non-empty* mismatched result commandId
+    and otherwise fell through to check type/map/target, so a stale or
+    external result with no commandId at all -- but a matching type and
+    target -- was reported as this task's own success (Codex's simulation
+    reproduced exactly this: published=[{id: rmf-own, is_completed: true,
+    success: true}]). Ownership requires an exact commandId match;
+    empty/missing must fail closed like any other mismatch.
+    """
+    node = make_node()
+    node.task_id = 'cmd-ok'
+    node.is_async_command = True
+    node.saw_running = True
+    node.current_command_id = 'own-id-2'
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_target_map_name = '8F'
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node.last_pose = Pose(1.0, 1.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'own-id-2',
+        'state': 'COMMAND_STATE_UNKNOWN'
+    })
+    node._get_last_command_result_response = MagicMock(return_value={
+        'commandId': None,
+        'result': {
+            'success': True,
+            'errorCode': 0
+        },
+        'command': {
+            'moveToPoseCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert published_payloads(node) == []
+
+
+def test_sync_switch_map_own_id_snapshot_is_not_reconciled_as_external() -> None:
+    """A RUNNING command observed during a synchronous switch_map dispatch is never reconciled.
+
+    Reproduces Codex re-review ISS34-040 blocking-B: _reconcile_pending_dispatch_snapshot()
+    used to run for every dispatch, including synchronous ones (switch_map)
+    that never capture an ownership id at all. A monitor_external_control()
+    poll during such a dispatch that observed the dispatch's own in-flight
+    command_id would, once (mis)reconciled, treat that own id as external
+    and set external_control_active=True right after the dispatch's own
+    success was published -- incorrectly rejecting subsequent RMF commands
+    with external_busy until the next live poll cleared it.
+
+    Drives dispatch (_execute_command) and detection
+    (monitor_external_control) on real threads: the mocked
+    _execute_switch_map_sync pauses on an Event (mirroring the real gRPC
+    work), which is the exact window where dispatching=True and no
+    ownership id exists to compare a snapshot against.
+    """
+    node = make_node(client_methods=['switch_map'])
+    node.method_mapping = {}
+
+    reached_dispatch = threading.Event()
+    proceed_with_dispatch = threading.Event()
+
+    def racing_switch_map(_args: dict, _task_id: Optional[str]) -> None:
+        reached_dispatch.set()
+        proceed_with_dispatch.wait(timeout=2.0)
+        node._publish_command_completion(success=True, error_code=0, task_id='cmd-switch-map')
+
+    node._execute_switch_map_sync = MagicMock(side_effect=racing_switch_map)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'own-switch-map-id',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToLocationCommand': {
+                    'targetLocationId': 'somewhere'
+                }
+            },
+        })
+
+    dispatch_thread = threading.Thread(
+        target=node._execute_command,
+        args=({
+            'id': 'cmd-switch-map',
+            'method': 'switch_map',
+            'args': {}
+        },),
+    )
+    dispatch_thread.start()
+    assert reached_dispatch.wait(timeout=2.0), 'dispatch never reached switch_map execution'
+    assert node.dispatching is True
+
+    # monitor observes the dispatch's own in-flight command as RUNNING while
+    # dispatching=True; it must defer, not judge ownership yet.
+    asyncio.run(node.monitor_external_control())
+    assert node.external_control_active is False
+    assert node._pending_dispatch_snapshot_id == 'own-switch-map-id'
+
+    proceed_with_dispatch.set()
+    dispatch_thread.join(timeout=2.0)
+    assert not dispatch_thread.is_alive()
+    assert node.dispatching is False
+
+    # The switch_map's own success was published, and reconciliation must
+    # never have run for it: no bogus external detection.
+    assert published_payloads(node) == [{'id': 'cmd-switch-map', 'is_completed': True, 'success': True}]
+    assert node.external_control_active is False
+    assert node._pending_dispatch_snapshot_id is None
+
+
 def test_wrong_type_running_command_is_not_bound_when_dispatch_lacked_command_id() -> None:
     """publish_result() never binds current_command_id while it is unset, regardless of command type.
 

@@ -21,8 +21,8 @@ timeouts:
   command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
   command_start: 15.0       # Max wait for RUNNING after an async command (move_to_pose/return_home) is dispatched
   motion_progress: 30.0     # Max time with no position/yaw change while RUNNING before treated as stuck
-  own_return_home_retention: 5.0  # Grace period after a dock completes during which a lingering RUNNING
-  # return_home is still recognized as ours, not external (Plan §7.4 concern (b))
+  own_return_home_retention: 5.0  # Grace period after any own async command completes during which a
+  # lingering RUNNING state with the same command_id is still recognized as ours, not external (concern (b))
 
 # Navigation tolerances (distances in meters, angles in radians)
 navigation:

@@ -19,8 +19,14 @@ Covers the stuck-robot bugs fixed in the race-condition audit:
 - every failure path of _execute_command publishes a failure completion
 - a re-issued in-flight command adopts the new ID without re-execution
 - the completion watchdog force-completes a silent task (error_code=-5)
-- a wrong command_id binding is undone after persistent mismatches
+- a persistent command_id mismatch never undoes the own binding
 - completion publishing is idempotent and never wipes a newer task's state
+
+Also covers the Issue #34 Plan §5 generalization of external-command
+detection (ISS34-036): any non-own RUNNING command (not only
+returnHomeCommand) preempts an active RMF task or marks busy while idle,
+ownership is decided purely by bounded command_id equality, and an
+external id can never be rebound onto an own task's completion.
 """
 # ruff: noqa: SLF001
 
@@ -125,8 +131,8 @@ def make_node(client_methods: list = []) -> KachakaApiClientByZenoh:
     node.external_control_active = False
     node._external_command_id = None
     node.own_return_home_retention = 5.0
-    node._recently_own_return_home_id = None
-    node._recently_own_return_home_until = None
+    node._recently_completed_own_command_id = None
+    node._recently_completed_own_command_until = None
     node._state_seq = 0
     return node
 
@@ -253,23 +259,28 @@ def test_watchdog_does_not_fire_while_progressing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A-3: wrong command_id binding is undone after persistent mismatches
+# A-3: a persistent command_id mismatch never undoes the own binding
 # ---------------------------------------------------------------------------
 
 
-def test_persistent_mismatch_unbinds_command_id() -> None:
-    """MAX_IGNORED_MISMATCHES consecutive mismatches undo the binding."""
+def test_persistent_mismatch_never_unbinds_command_id() -> None:
+    """Repeated mismatches, even past MAX_IGNORED_MISMATCHES, never clear current_command_id.
+
+    Reproduces the ISS34-035 gap analysis finding: unbinding on persistent
+    mismatch used to let a same-type/target external command rebind onto
+    this task once _ignored_result_count reached MAX_IGNORED_MISMATCHES.
+    Own binding is decided once, synchronously, at dispatch (StartCommand's
+    response) and must never be undone by later mismatched observations --
+    a genuinely external command is instead handled by
+    monitor_external_control(), which preempts the task outright.
+    """
     node = make_node()
     node.task_id = 'cmd-3'
     node.current_command_id = 'grpc-old'
 
-    for _ in range(KachakaApiClientByZenoh.MAX_IGNORED_MISMATCHES - 1):
+    for _ in range(KachakaApiClientByZenoh.MAX_IGNORED_MISMATCHES * 2):
         node._note_ignored_mismatch('command state', 'grpc-new')
         assert node.current_command_id == 'grpc-old'
-
-    node._note_ignored_mismatch('command state', 'grpc-new')
-    assert node.current_command_id is None
-    assert node._ignored_result_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -928,6 +939,103 @@ def test_external_return_home_preempts_active_rmf_task() -> None:
     assert node.task_id is None
 
 
+def test_external_move_to_location_home_preempts_active_rmf_task() -> None:
+    """A moveToLocationCommand(targetLocationId='home') not issued by this bridge preempts immediately.
+
+    Reproduces the ISS34-034 hardware finding: the real Kachaka app's
+    Return Home button issues moveToLocationCommand, not returnHomeCommand,
+    so a returnHomeCommand-only check never observes it. Detection must
+    treat any non-own RUNNING command as external regardless of type
+    (Issue #34 Plan §5), so this is caught on the very first observation.
+    """
+    node = make_node()
+    node.task_id = 'cmd-active-move'
+    node.last_command = {'id': 'cmd-active-move', 'method': 'move_to_pose', 'args': {}}
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-move-to-location-home',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToLocationCommand': {
+                    'targetLocationId': 'home'
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-active-move',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+
+
+def test_external_move_to_location_non_home_target_preempts_active_rmf_task() -> None:
+    """A moveToLocationCommand toward any targetLocationId (not just 'home') preempts immediately.
+
+    Detection must never depend on the target value: any non-own RUNNING
+    moveToLocationCommand is external regardless of destination.
+    """
+    node = make_node()
+    node.task_id = 'cmd-active-move-2'
+    node.last_command = {'id': 'cmd-active-move-2', 'method': 'move_to_pose', 'args': {}}
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-move-to-location-other',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToLocationCommand': {
+                    'targetLocationId': 'kitchen'
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-active-move-2',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+
+
+def test_external_unrecognized_command_type_defaults_to_busy() -> None:
+    """A RUNNING command of a type not in KNOWN_MOVEMENT_COMMAND_FIELDS still defaults to busy.
+
+    Detection never gates on the known-type set -- it exists only to
+    control a diagnostic log message. Any non-own RUNNING command occupies
+    the movement/command-processor slot (Issue #34 Plan §5).
+    """
+    node = make_node()
+    node.task_id = 'cmd-active-move-3'
+    node.last_command = {'id': 'cmd-active-move-3', 'method': 'move_to_pose', 'args': {}}
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'ext-unknown-type',
+        'state': 'COMMAND_STATE_RUNNING',
+        'command': {
+            'someFutureCommand': {}
+        },
+    })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-active-move-3',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+
+
 def test_own_dock_return_home_is_not_treated_as_external() -> None:
     """RMF's own dispatched dock (return_home) is never classified as external.
 
@@ -960,6 +1068,43 @@ def test_own_dock_return_home_is_not_treated_as_external() -> None:
     assert published_payloads(node) == []
     assert node.external_control_active is False
     assert node.task_id == 'cmd-dock'
+
+
+def test_own_move_to_pose_is_not_treated_as_external() -> None:
+    """RMF's own dispatched move_to_pose is never classified as external.
+
+    Ownership is decided purely by command_id equality, the same as dock
+    (Issue #34 Plan §5); this also demonstrates that the upstream requester
+    (e.g. an RMF Web API task like kachaka-rmf-control's charge_station
+    request) is irrelevant to the ownership judgement -- only whether the
+    bridge itself dispatched and bound the command_id matters.
+    """
+    node = make_node(client_methods=['move_to_pose', 'stub'])
+    node.grpc_connection_check = MagicMock(return_value=True)
+    node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response(
+        command_id='own-move-to-pose-1'))
+
+    node._execute_command({'id': 'cmd-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 2.0, 'yaw': 0.0}})
+    assert node.current_command_id == 'own-move-to-pose-1'
+
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'own-move-to-pose-1',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 2.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == []
+    assert node.external_control_active is False
+    assert node.task_id == 'cmd-move'
 
 
 def test_external_return_home_id_conflict_with_rmf_dock_is_not_reported_as_success() -> None:
@@ -1126,6 +1271,84 @@ def test_start_command_success_and_id_bind_are_atomic_under_concurrent_monitor()
     assert node.current_command_id == 'own-dock-race-1'
 
 
+def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispatch_settles() -> None:
+    """monitor_external_control() defers while dispatching, but still catches the external command after.
+
+    Issue #34 Plan §5 dispatch-pending hold: while dispatching=True our own
+    command_id is not yet bound (_execute_async_stub_dispatch's gRPC call
+    runs outside _command_lock), so a concurrent monitor_external_control()
+    poll must not judge ownership yet -- it could misclassify our own
+    not-yet-bound dispatch as external. But deferring must not mean
+    permanently missing a genuinely external command: once the dispatch
+    settles and current_command_id is bound, the same external command_id
+    observed on the next poll must still be recognized and preempt/mark
+    busy immediately, not be silently dropped by having deferred once.
+
+    Drives command dispatch (_execute_command) and detection
+    (monitor_external_control) on real threads through their real code
+    paths: the mocked stub.StartCommand pauses on an Event outside
+    _command_lock (mirroring the real gRPC call), which is the exact window
+    where dispatching=True but current_command_id is still unbound.
+    """
+    node = make_node(client_methods=['return_home', 'stub'])
+    node.method_mapping = {'dock': 'return_home'}
+    node.grpc_connection_check = MagicMock(return_value=True)
+
+    reached_grpc_call = threading.Event()
+    proceed_with_grpc = threading.Event()
+
+    def racing_start_command(_request: object) -> object:
+        reached_grpc_call.set()
+        proceed_with_grpc.wait(timeout=2.0)
+        return stub_start_command_response(command_id='own-dock-race-2')
+
+    node.kachaka_client.stub.StartCommand = MagicMock(side_effect=racing_start_command)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-during-dispatch',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToLocationCommand': {
+                    'targetLocationId': 'home'
+                }
+            },
+        })
+
+    dispatch_thread = threading.Thread(
+        target=node._execute_command,
+        args=({
+            'id': 'cmd-dock-race-2',
+            'method': 'dock',
+            'args': {}
+        },),
+    )
+    dispatch_thread.start()
+    assert reached_grpc_call.wait(timeout=2.0), 'dispatch never reached the gRPC call'
+    assert node.dispatching is True
+
+    asyncio.run(node.monitor_external_control())
+    assert published_payloads(node) == []
+    assert node.external_control_active is False
+
+    proceed_with_grpc.set()
+    dispatch_thread.join(timeout=2.0)
+    assert not dispatch_thread.is_alive()
+    assert node.current_command_id == 'own-dock-race-2'
+    assert node.dispatching is False
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-dock-race-2',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node._external_command_id == 'ext-during-dispatch'
+    assert node.task_id is None
+
+
 def test_recently_completed_dock_return_home_is_not_treated_as_external() -> None:
     """A dock that just completed is not mistaken for external control (concern (b)).
 
@@ -1136,8 +1359,8 @@ def test_recently_completed_dock_return_home_is_not_treated_as_external() -> Non
     node = make_node(client_methods=['move_to_pose'])
     node.task_id = None  # dock already completed; task_id was reset
     node.last_command = {'id': 'cmd-dock-done', 'method': 'dock', 'args': {}}
-    node._recently_own_return_home_id = 'own-return-home-2'
-    node._recently_own_return_home_until = time.monotonic() + node.own_return_home_retention
+    node._recently_completed_own_command_id = 'own-return-home-2'
+    node._recently_completed_own_command_until = time.monotonic() + node.own_return_home_retention
     node._get_command_state_response = MagicMock(return_value={
         'commandId': 'own-return-home-2',
         'state': 'COMMAND_STATE_RUNNING',
@@ -1158,6 +1381,44 @@ def test_recently_completed_dock_return_home_is_not_treated_as_external() -> Non
     node._execute_async_stub_dispatch.assert_called_once()
 
 
+def test_recently_completed_move_to_pose_is_not_treated_as_external() -> None:
+    """A move_to_pose that just completed/was superseded is not mistaken for external control.
+
+    Generalizes concern (b) beyond dock/return_home (Issue #34 Plan §5): a
+    cancel/supersession or ordinary completion of a move_to_pose can also
+    leave Kachaka briefly reporting the old command_id as RUNNING, and that
+    must not be misclassified as an external command either.
+    """
+    node = make_node(client_methods=['move_to_pose'])
+    node.task_id = None  # move_to_pose already completed/superseded; task_id was reset
+    node.last_command = {'id': 'cmd-move-done', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 1.0}}
+    node._recently_completed_own_command_id = 'own-move-2'
+    node._recently_completed_own_command_until = time.monotonic() + node.own_return_home_retention
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'own-move-2',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 1.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert node.external_control_active is False
+    assert published_payloads(node) == []
+
+    # A following RMF move must not be rejected with external_busy.
+    node._execute_async_stub_dispatch = MagicMock(return_value={'commandId': 'grpc-next-move-2'})
+    node._execute_command({'id': 'cmd-next-move-2', 'method': 'move_to_pose', 'args': {'x': 5.0, 'y': 5.0}})
+    assert published_payloads(node) == []
+    node._execute_async_stub_dispatch.assert_called_once()
+
+
 def test_own_return_home_retention_recorded_on_dock_completion() -> None:
     """A successful dock completion records its command_id for the retention grace period."""
     node = make_node()
@@ -1167,9 +1428,29 @@ def test_own_return_home_retention_recorded_on_dock_completion() -> None:
 
     assert node._publish_command_completion(success=True, error_code=0) is True
 
-    assert node._recently_own_return_home_id == 'own-return-home-3'
-    assert node._recently_own_return_home_until is not None
-    assert node._recently_own_return_home_until > time.monotonic()
+    assert node._recently_completed_own_command_id == 'own-return-home-3'
+    assert node._recently_completed_own_command_until is not None
+    assert node._recently_completed_own_command_until > time.monotonic()
+    assert node.task_id is None
+
+
+def test_own_command_retention_recorded_on_move_to_pose_completion() -> None:
+    """A successful move_to_pose completion also records its command_id for the retention grace period.
+
+    Generalizes retention beyond the dock-only gate that used to guard
+    _record_own_return_home_retention (Issue #34 Plan §5): any own async
+    command with a bound command_id gets the same grace period.
+    """
+    node = make_node()
+    node.task_id = 'cmd-move-3'
+    node.last_command = {'id': 'cmd-move-3', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 1.0}}
+    node.current_command_id = 'own-move-3'
+
+    assert node._publish_command_completion(success=True, error_code=0) is True
+
+    assert node._recently_completed_own_command_id == 'own-move-3'
+    assert node._recently_completed_own_command_until is not None
+    assert node._recently_completed_own_command_until > time.monotonic()
     assert node.task_id is None
 
 
@@ -1211,9 +1492,9 @@ def test_own_return_home_retention_recorded_via_publish_result_completion_path()
 
     assert published_payloads(node) == [{'id': 'cmd-dock-normal', 'is_completed': True, 'success': True}]
     assert node.task_id is None
-    assert node._recently_own_return_home_id == 'own-return-home-normal'
-    assert node._recently_own_return_home_until is not None
-    assert node._recently_own_return_home_until > time.monotonic()
+    assert node._recently_completed_own_command_id == 'own-return-home-normal'
+    assert node._recently_completed_own_command_until is not None
+    assert node._recently_completed_own_command_until > time.monotonic()
 
     # A lingering RUNNING return_home right after must still be recognized as ours.
     node._get_command_state_response = MagicMock(return_value={
@@ -1259,6 +1540,179 @@ def test_external_control_ends_when_return_home_no_longer_running() -> None:
 
     assert node.external_control_active is False
     assert node._external_command_id is None
+
+
+def test_external_command_while_idle_sets_busy_and_clears_when_gone() -> None:
+    """An external command observed while RMF is idle sets busy, and clears once it disappears.
+
+    No active RMF task exists (task_id is None) when the external command
+    starts, so there is nothing to preempt -- only external_control_active
+    needs to flip to True. Once the command is no longer RUNNING,
+    external_control_active clears and a fresh state publish follows on the
+    next main-loop iteration's publish_state() call (Issue #34 Plan §5).
+    """
+    node = make_node()
+    node.task_id = None
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-idle-1',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToLocationCommand': {
+                    'targetLocationId': 'home'
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == []  # nothing to preempt
+    assert node.external_control_active is True
+    assert node._external_command_id == 'ext-idle-1'
+
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'ext-idle-1',
+        'state': 'COMMAND_STATE_SUCCEEDED'
+    })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert node.external_control_active is False
+    assert node._external_command_id is None
+
+
+def test_external_control_active_persists_across_external_command_id_switch() -> None:
+    """Busy must not be cleared just because the external command_id changes to another non-own id.
+
+    Reproduces Issue #34 Plan §5's continuity requirement: e.g. the Kachaka
+    app's Return Home completes and the user immediately issues another
+    external move -- external_control_active must stay True the whole time,
+    only clearing once no non-own RUNNING command remains at all.
+    """
+    node = make_node()
+    node.task_id = None
+    node.external_control_active = True
+    node._external_command_id = 'ext-first'
+
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-second',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 1.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert node.external_control_active is True
+    assert node._external_command_id == 'ext-second'
+    assert published_payloads(node) == []
+
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'ext-second',
+        'state': 'COMMAND_STATE_SUCCEEDED'
+    })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert node.external_control_active is False
+    assert node._external_command_id is None
+
+
+def test_external_move_to_pose_with_matching_target_preempts_and_is_never_rebound() -> None:
+    """An external moveToPoseCommand toward the same target as ours preempts, never rebinds its id.
+
+    Reproduces the ISS34-035 gap analysis finding: an external move whose
+    target happens to be within RMF's own command_match tolerance used to
+    be able to rebind onto the active task after repeated mismatches
+    (_note_ignored_mismatch's old unbind-then-rebind path). Same-target
+    coincidence must not matter -- a non-own id is always external.
+    """
+    node = make_node()
+    node.task_id = 'cmd-own-move'
+    node.last_command = {'id': 'cmd-own-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 1.0}}
+    node.current_command_id = 'own-move-active'
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-move-same-target',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 1.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-own-move',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+    assert node.current_command_id != 'ext-move-same-target'
+
+
+def test_external_move_to_pose_never_rebinds_even_after_repeated_mismatches() -> None:
+    """Repeated command-state mismatches against an own binding never let an external id take over.
+
+    End-to-end version of the ISS34-035 gap: even if publish_result() polls
+    the mismatching external id MAX_IGNORED_MISMATCHES times first (as could
+    happen before monitor_external_control() catches it), current_command_id
+    must remain the original own id throughout, and once
+    monitor_external_control() runs it must preempt rather than let the
+    external id quietly take over.
+    """
+    node = make_node()
+    node.task_id = 'cmd-own-move-2'
+    node.last_command = {'id': 'cmd-own-move-2', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 1.0}}
+    node.current_command_id = 'own-move-active-2'
+    node.is_async_command = True
+    node.saw_running = True
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'ext-move-persistent',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 1.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    for _ in range(KachakaApiClientByZenoh.MAX_IGNORED_MISMATCHES * 2):
+        asyncio.run(node.publish_result())
+        assert node.current_command_id == 'own-move-active-2'
+
+    assert published_payloads(node) == []
+
+    asyncio.run(node.monitor_external_control())
+
+    assert published_payloads(node) == [{
+        'id': 'cmd-own-move-2',
+        'is_completed': True,
+        'success': False,
+        'reason': 'external_preempted',
+    }]
+    assert node.external_control_active is True
+    assert node.task_id is None
+    assert node.current_command_id != 'ext-move-persistent'
 
 
 # ---------------------------------------------------------------------------

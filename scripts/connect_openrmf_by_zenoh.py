@@ -172,8 +172,8 @@ class KachakaApiClientByZenoh:
     external_control_active: bool
     own_return_home_retention: float
 
-    # Consecutive command_id mismatches tolerated before undoing a binding
-    # (one mismatch is observed roughly once per main loop iteration).
+    # Consecutive command_id mismatches logged before re-warning (own binding
+    # is never undone by a mismatch -- see _note_ignored_mismatch).
     MAX_IGNORED_MISMATCHES = 5
 
     # Maps the internal (post method_mapping) Kachaka method name to the
@@ -184,6 +184,20 @@ class KachakaApiClientByZenoh:
         'move_to_pose': 'moveToPoseCommand',
         'return_home': 'returnHomeCommand',
     }
+
+    # Kachaka command types known to occupy the robot's movement/command
+    # slot; used only to log a clear diagnostic when a RUNNING command's type
+    # is not one of these. Detection itself never gates on this set: a
+    # non-own RUNNING command of any (including unrecognized) type is
+    # treated as external, since the real Kachaka app's Return Home button
+    # was observed on hardware to issue moveToLocationCommand rather than
+    # returnHomeCommand (ISS34-034), and any future/unknown command type must
+    # default to busy rather than being silently ignored (Issue #34 Plan §5).
+    KNOWN_MOVEMENT_COMMAND_FIELDS = frozenset({
+        'returnHomeCommand',
+        'moveToLocationCommand',
+        'moveToPoseCommand',
+    })
 
     def __init__(
         self,
@@ -328,16 +342,19 @@ class KachakaApiClientByZenoh:
         self.expected_kachaka_method: Optional[str] = None
         self.command_target_map_name: Optional[str] = None
         self.command_target_pose: Optional[Pose] = None
-        # True while an externally-triggered returnHome (not issued by this
-        # bridge) is observed running on the robot (Issue #34 Plan §7.4).
+        # True while a RUNNING Kachaka command not issued by this bridge is
+        # observed on the robot (Issue #34 Plan §5/§7.4, generalized from
+        # returnHome-only to any command type -- ISS34-034/ISS34-035).
         self.external_control_active = False
         self._external_command_id: Optional[str] = None
-        # The command_id and expiry of the own dock (return_home) that most
-        # recently completed; lets _is_own_return_home() still recognize a
-        # briefly-lingering RUNNING return_home as ours after task_id has
-        # already been reset (Issue #34 Plan §7.4, Codex review concern (b)).
-        self._recently_own_return_home_id: Optional[str] = None
-        self._recently_own_return_home_until: Optional[float] = None
+        # The command_id and expiry of the own async command (any method,
+        # not only dock/return_home) that most recently completed; lets
+        # _is_own_command_id() still recognize a briefly-lingering RUNNING
+        # command as ours after task_id has already been reset (Issue #34
+        # Plan §5, generalized from the return_home-only grace period,
+        # Codex review concern (b)).
+        self._recently_completed_own_command_id: Optional[str] = None
+        self._recently_completed_own_command_until: Optional[float] = None
         # Monotonically increasing sequence number for the unified state
         # payload (Issue #34 Plan §5.1).
         self._state_seq = 0
@@ -486,18 +503,27 @@ class KachakaApiClientByZenoh:
         return (time.monotonic() - self.last_progress_at) >= self.command_completion_timeout
 
     def _note_ignored_mismatch(self, source: str, observed_id: Optional[str]) -> None:
-        """Track command_id mismatches and undo a wrong binding when persistent.
+        """Log a persistent command_id mismatch without ever undoing the own binding.
 
-        Binding the wrong command_id (e.g. the previous command's RUNNING state
-        observed right after cancel_all) would otherwise make every later
-        state/result be ignored and the completion never reach RMF.
+        Never clears current_command_id. StartCommand's response binds our
+        own command_id synchronously at dispatch (_execute_async_stub_dispatch),
+        so once bound it is authoritative for the life of the task; a
+        mismatch here just means Kachaka is reporting a different command's
+        state/result, not evidence that our own binding was wrong. Unbinding
+        used to let a persistent external command_id whose type/target
+        happened to match the dispatched task rebind onto this task once
+        _ignored_result_count reached MAX_IGNORED_MISMATCHES -- a same-type,
+        same-ish-target external command could then be silently attributed
+        to this task's completion (ISS34-035 gap analysis). A genuinely
+        external command is instead handled by monitor_external_control(),
+        which preempts this task outright rather than waiting for repeated
+        mismatches (Issue #34 Plan §5).
         """
         self._ignored_result_count += 1
         if self._ignored_result_count >= self.MAX_IGNORED_MISMATCHES:
             self._log_warning(f'{source} command_id {observed_id} mismatched bound '
                               f'{self.current_command_id} {self._ignored_result_count} consecutive times; '
-                              'unbinding to allow re-binding')
-            self.current_command_id = None
+                              'still ignoring (own binding is never undone by a mismatch)')
             self._ignored_result_count = 0
         else:
             self.logger.debug(
@@ -596,6 +622,21 @@ class KachakaApiClientByZenoh:
         every command_id-binding call site rejects a same-type command that
         cannot be confirmed as ours, rather than binding on type alone
         (Codex re-review ISS34-010 blocking-2, Issue #34 Plan §7.3).
+
+        Residual scope note (ISS34-036): this type/target confirmation is
+        only ever consulted by publish_result()'s first-bind path, reached
+        solely when current_command_id was never captured at dispatch (a
+        successful StartCommand response with no command_id) -- an anomaly
+        the stub-direct dispatch was specifically introduced to eliminate
+        (ISS34-002-fix3), so it should not occur in practice. If it ever
+        does and a same-type/target external command races it, monitor_
+        external_control() still runs first every main loop iteration and
+        polls independently; ownership here is decided by type/target, not
+        by the bounded own-id set _is_own_command_id() uses. Removing this
+        path entirely (fail the task via command_start_timeout instead of
+        ever binding without a captured id) was considered but left out of
+        this change's scope to avoid destabilizing the ISS34-006/ISS34-010
+        binding behavior these type/target checks were reviewed for.
         """
         if not self._observed_command_type_matches_expected(command_dict):
             return False
@@ -696,63 +737,78 @@ class KachakaApiClientByZenoh:
 
         return True, None
 
-    def _is_own_return_home(self, observed_command_id: Optional[str]) -> bool:
-        """Return True when a RUNNING returnHomeCommand belongs to our own dispatched dock.
+    def _is_own_command_id(self, observed_command_id: Optional[str]) -> bool:
+        """Return True when a RUNNING command's id belongs to this bridge's own dispatch.
 
-        RMF issues return_home via the 'dock' RMF method (mapped to Kachaka's
-        return_home). Ownership is decided purely by command_id equality:
+        Ownership is decided purely by command_id equality against the
+        bounded own-id set -- the currently bound dispatch (any method:
         move_to_pose/return_home dispatch captures command_id synchronously
-        via stub.StartCommand() (see _execute_async_stub_dispatch), so
-        current_command_id is bound before this is ever consulted. An unbound
-        current_command_id is therefore treated as not ours -- never as
-        plausibly ours within a grace window -- so a genuinely external
-        returnHome racing our own dispatch is recognized as external instead
-        of being assumed ours (Issue #34 Plan §7.4, Codex re-review ISS34-010
-        blocking-3: the previous running_state_wait-window fallback assumed
-        an unbound id was ours, which misclassified an external returnHome
-        arriving in that window as our own). A dock that completed just
-        before this poll is still recognized via the short-lived
-        _recently_own_return_home_* grace period (concern (b)), so the
-        trailing RUNNING state Kachaka can report right after completion is
-        not mistaken for external control.
-        """
-        if self.task_id is not None and self.last_command is not None and self.last_command.get('method') == 'dock':
-            return self.current_command_id is not None and self.current_command_id == observed_command_id
+        via stub.StartCommand(), see _execute_async_stub_dispatch) or a
+        just-completed/just-superseded own command still within its
+        retention grace period. Command type/target are never consulted
+        here (Issue #34 Plan §5, generalized from a return_home-only,
+        dock-method-gated check to any RMF-dispatched command -- ISS34-034
+        found the real Kachaka app's Return Home button issues
+        moveToLocationCommand, not returnHomeCommand, so a type-specific
+        check misses it entirely).
 
-        if (self._recently_own_return_home_id is not None and
-                observed_command_id == self._recently_own_return_home_id and
-                self._recently_own_return_home_until is not None and
-                time.monotonic() < self._recently_own_return_home_until):
+        An unbound current_command_id is therefore treated as not ours --
+        never as plausibly ours within a grace window -- so a genuinely
+        external command racing our own dispatch (still in flight, not yet
+        bound) is recognized as external instead of being assumed ours
+        (Codex re-review ISS34-010 blocking-3). A command that completed
+        just before this poll is still recognized via the short-lived
+        _recently_completed_own_command_* grace period (concern (b)), so
+        the trailing RUNNING state Kachaka can report right after
+        completion or cancellation/supersession is not mistaken for
+        external control.
+        """
+        if observed_command_id is None:
+            return False
+        if self.current_command_id is not None and observed_command_id == self.current_command_id:
+            return True
+        if (self._recently_completed_own_command_id is not None and
+                observed_command_id == self._recently_completed_own_command_id and
+                self._recently_completed_own_command_until is not None and
+                time.monotonic() < self._recently_completed_own_command_until):
             return True
         return False
 
-    def _handle_external_return_home_started(self, command_id: Optional[str]) -> None:
+    def _handle_external_command_started(self, command_id: Optional[str]) -> None:
         """Preempt any active RMF task and mark external control as active."""
         preempted_task_id = self.task_id
         if preempted_task_id is not None:
-            self._log_error_msg(f'External returnHome (command_id={command_id}) observed; '
-                                f'preempting active RMF task {preempted_task_id}')
+            self._log_error_msg(
+                f'External command (command_id={command_id}) observed; preempting active RMF task {preempted_task_id}')
             self._publish_command_completion(success=False,
                                              error_code=-8,
                                              task_id=preempted_task_id,
                                              reason='external_preempted')
         else:
-            self._log_info(f'External returnHome (command_id={command_id}) observed while idle')
+            self._log_info(f'External command (command_id={command_id}) observed while idle')
         self.external_control_active = True
         self._external_command_id = command_id
 
-    def _handle_external_return_home_ended(self) -> None:
+    def _handle_external_command_ended(self) -> None:
         """Mark external control as no longer active."""
-        self._log_info(f'External returnHome (command_id={self._external_command_id}) ended')
+        self._log_info(f'External command (command_id={self._external_command_id}) ended')
         self.external_control_active = False
         self._external_command_id = None
 
     async def monitor_external_control(self) -> None:
-        """Detect Kachaka commands not issued by this bridge (Issue #34 Plan §7.4).
+        """Detect Kachaka commands not issued by this bridge (Issue #34 Plan §5).
 
         Runs every main loop iteration regardless of whether an RMF task is
-        active, so an externally-triggered returnHome (e.g. from the Kachaka
-        app or a low-battery auto-return) is observed even while idle.
+        active, so an externally-triggered command (e.g. the Kachaka app's
+        Return Home button, a low-battery auto-return, or a direct API call)
+        is observed even while idle. Detection is generalized from a
+        returnHomeCommand-only check to any RUNNING command whose command_id
+        is not in the bounded own-id set (see _is_own_command_id):
+        moveToLocationCommand/moveToPoseCommand are common examples, and an
+        unrecognized command type still defaults to busy rather than being
+        silently ignored (ISS34-034 found the real Return Home button issues
+        moveToLocationCommand, which the previous returnHomeCommand-only
+        check never caught).
         """
         method_name = 'monitor_external_control'
         try:
@@ -764,18 +820,38 @@ class KachakaApiClientByZenoh:
             return
 
         with self._command_lock:
+            if self.dispatching:
+                # A dispatch is in flight and has not yet synchronously bound
+                # its own command_id (_execute_async_stub_dispatch runs the
+                # gRPC call outside _command_lock while dispatching=True).
+                # Judging ownership now could misclassify our own
+                # not-yet-bound dispatch as external; defer to the next poll,
+                # by which point the dispatch has either bound
+                # current_command_id or failed and reset task_id (Issue #34
+                # Plan §5 dispatch-pending hold).
+                return
+
             command_dict = state_res.get('command')
-            is_return_home = isinstance(command_dict, dict) and 'returnHomeCommand' in command_dict
             is_running = self._is_running_state(state_res.get('state'))
             observed_id = state_res.get('commandId')
+            is_external_now = is_running and observed_id is not None and not self._is_own_command_id(observed_id)
 
-            is_external_now = (is_return_home and is_running and observed_id is not None and
-                               not self._is_own_return_home(observed_id))
-
-            if is_external_now and not self.external_control_active:
-                self._handle_external_return_home_started(observed_id)
-            elif not is_external_now and self.external_control_active:
-                self._handle_external_return_home_ended()
+            if is_external_now:
+                if not isinstance(command_dict, dict) or not any(field in command_dict
+                                                                 for field in self.KNOWN_MOVEMENT_COMMAND_FIELDS):
+                    self.logger.warning(
+                        'Unrecognized RUNNING command type %r (command_id=%s); defaulting to busy',
+                        command_dict,
+                        observed_id,
+                    )
+                if not self.external_control_active:
+                    self._handle_external_command_started(observed_id)
+                elif observed_id != self._external_command_id:
+                    self._log_info(f'External command switched from {self._external_command_id} to {observed_id}; '
+                                   'external_control_active remains True')
+                    self._external_command_id = observed_id
+            elif self.external_control_active:
+                self._handle_external_command_ended()
 
     async def publish_pose(self) -> None:
         """Publish the current robot pose to Zenoh.
@@ -1132,7 +1208,7 @@ class KachakaApiClientByZenoh:
                 # Publish and reset
                 self.last_command_result = result
                 if self._publish_to_zenoh(self.command_is_completed_pub, result.as_payload()) and result.is_completed:
-                    self._record_own_return_home_retention()
+                    self._record_recently_completed_own_command()
                     self._reset_async_command_state()
 
         except RpcError as e:
@@ -1855,22 +1931,26 @@ class KachakaApiClientByZenoh:
             self._publish_command_completion(success=False, error_code=-1, task_id=task_id)
             raise
 
-    def _record_own_return_home_retention(self) -> None:
-        """Remember a completing dock's command_id for the ownership grace period.
+    def _record_recently_completed_own_command(self) -> None:
+        """Remember a completing own command's command_id for the ownership grace period.
 
-        Must run on every completion path immediately before
-        _reset_async_command_state() clears current_command_id, not only
-        the explicit _publish_command_completion() path: publish_result()'s
+        Applies to any completing method (move_to_pose, dock/return_home,
+        ...) that had a bound command_id, not only dock -- generalized from
+        the previous dock-only check so a briefly-lingering RUNNING state
+        after any own command's completion or cancellation/supersession is
+        still recognized as ours (Issue #34 Plan §5, concern (b)). Must run
+        on every completion path immediately before
+        _reset_async_command_state() clears current_command_id, not only the
+        explicit _publish_command_completion() path: publish_result()'s
         normal async-success completion calls _reset_async_command_state()
         directly and previously bypassed this recording entirely, so
-        _is_own_return_home() had no record to recognize a briefly-lingering
-        RUNNING return_home right after an ordinary dock success (Issue #34
-        Plan §7.4 concern (b), Codex re-review ISS34-010 recommendation-2).
+        _is_own_command_id() had no record to recognize a briefly-lingering
+        RUNNING command right after an ordinary success (Codex re-review
+        ISS34-010 recommendation-2).
         """
-        if (self.last_command is not None and self.last_command.get('method') == 'dock' and
-                self.current_command_id is not None):
-            self._recently_own_return_home_id = self.current_command_id
-            self._recently_own_return_home_until = time.monotonic() + self.own_return_home_retention
+        if self.current_command_id is not None:
+            self._recently_completed_own_command_id = self.current_command_id
+            self._recently_completed_own_command_until = time.monotonic() + self.own_return_home_retention
 
     def _reset_async_command_state(self) -> None:
         """Reset all async command tracking state.
@@ -1969,7 +2049,7 @@ class KachakaApiClientByZenoh:
 
             # Clear all async command tracking state after publishing
             if target_task_id == self.task_id:
-                self._record_own_return_home_retention()
+                self._record_recently_completed_own_command()
                 self._reset_async_command_state()
             return True
 

@@ -96,6 +96,7 @@ def make_node(client_methods: list = []) -> KachakaApiClientByZenoh:
     node._client_lock = threading.RLock()
     node._dispatch_lock = threading.Lock()
     node.dispatching = False
+    node._pending_dispatch_snapshot_id = None
     node.last_progress_at = None
     node._ignored_result_count = 0
     node._first_grpc_failure_time = None
@@ -740,18 +741,23 @@ def test_final_pose_mismatch_is_not_reported_as_success() -> None:
 
 
 def test_wrong_type_running_command_is_not_bound_when_dispatch_lacked_command_id() -> None:
-    """A StartCommand response without commandId must not let a wrong-type RUNNING command bind later.
+    """publish_result() never binds current_command_id while it is unset, regardless of command type.
 
-    Reproduces Codex review ISS34-006's blocking finding: high-level
-    StartCommand often returns a bare Result with no commandId, so
-    current_command_id stays unbound after dispatch. Binding must still
-    require the observed command's type to match what was dispatched.
+    Codex re-review ISS34-037 blocking-1 removed publish_result()'s
+    type/target-based fallback bind entirely: ownership is captured solely
+    by StartCommand's response command_id at dispatch
+    (_execute_async_stub_dispatch), which now fails the task closed
+    (reason='missing_command_id') instead of ever leaving current_command_id
+    unbound while a task stays active. This state (current_command_id=None
+    with is_async_command=True) should therefore never arise in practice; if
+    it somehow does, an observed RUNNING command -- of any type -- must
+    still never be treated as progress or bound to this task.
     """
     node = make_node()
     node.task_id = 'cmd-nobind'
     node.is_async_command = True
     node.saw_running = False
-    node.current_command_id = None  # StartCommand response carried no commandId
+    node.current_command_id = None  # invariant violation: dispatch should have fail-closed instead
     node.expected_kachaka_method = 'move_to_pose'
     node.command_dispatched_at = time.monotonic()
     node._get_command_state_response = MagicMock(return_value={
@@ -769,8 +775,16 @@ def test_wrong_type_running_command_is_not_bound_when_dispatch_lacked_command_id
     assert published_payloads(node) == []
 
 
-def test_correct_type_running_command_binds_when_dispatch_lacked_command_id() -> None:
-    """A matching-type RUNNING command still binds normally after a commandId-less dispatch."""
+def test_correct_type_running_command_does_not_bind_when_dispatch_lacked_command_id() -> None:
+    """A matching-type RUNNING command does not bind current_command_id via publish_result() either.
+
+    Rewritten for the fail-closed design (Issue #34 Plan §7.3/§7.4, Codex
+    re-review ISS34-037 blocking-1): the previous fallback used to bind on a
+    type match alone once running_state_wait expired. That path is removed;
+    _execute_async_stub_dispatch is now the only place current_command_id is
+    ever set, and it fails the dispatch closed whenever StartCommand's
+    response carries no command_id.
+    """
     node = make_node()
     node.task_id = 'cmd-bind-ok'
     node.is_async_command = True
@@ -788,21 +802,17 @@ def test_correct_type_running_command_binds_when_dispatch_lacked_command_id() ->
 
     asyncio.run(node.publish_result())
 
-    assert node.current_command_id == 'grpc-bind-ok'
-    assert node.saw_running is True
-    assert published_payloads(node) == [{'id': 'cmd-bind-ok', 'is_completed': False}]
+    assert node.current_command_id is None
+    assert node.saw_running is False
+    assert published_payloads(node) == []
 
 
 def test_same_type_running_command_with_mismatched_target_is_not_bound() -> None:
     """A same-type RUNNING move_to_pose toward a different target is not bound to our task.
 
-    Reproduces Codex re-review ISS34-010 blocking-2: the previous bind
-    condition checked only that the observed command's type matched
-    (moveToPoseCommand), so a same-type command started by someone else (or
-    a stale one) toward a different destination would still bind and its
-    later success would be reported to RMF as our task's success. Binding
-    must also confirm the observed command's own target matches what we
-    dispatched (Issue #34 Plan §7.3).
+    Type/target confirmation is no longer part of the ownership decision at
+    all (Codex re-review ISS34-037 blocking-1 removed it): current_command_id
+    stays unbound regardless of how closely the observed command matches.
     """
     node = make_node()
     node.task_id = 'cmd-ext-move'
@@ -832,8 +842,18 @@ def test_same_type_running_command_with_mismatched_target_is_not_bound() -> None
     assert published_payloads(node) == []
 
 
-def test_same_type_running_command_with_matching_target_still_binds() -> None:
-    """A same-type RUNNING move_to_pose whose own target matches ours still binds normally."""
+def test_same_type_running_command_with_matching_target_does_not_bind_without_dispatch_time_id() -> None:
+    """Even a perfectly type/target-matching RUNNING command is never bound by publish_result().
+
+    Direct regression test for Codex re-review ISS34-037 blocking-1: the
+    previous design (test name ended in "_still_binds") treated a matching
+    command type and target as sufficient ownership proof and bound
+    current_command_id here. That was exactly the gap a same-type/target
+    external command racing an ID-less dispatch could exploit to have its
+    own success reported as this task's success. Ownership is now captured
+    exclusively at dispatch time (StartCommand's response command_id); this
+    match must not bind anything.
+    """
     node = make_node()
     node.task_id = 'cmd-own-move'
     node.is_async_command = True
@@ -857,9 +877,9 @@ def test_same_type_running_command_with_matching_target_still_binds() -> None:
 
     asyncio.run(node.publish_result())
 
-    assert node.current_command_id == 'own-move-1'
-    assert node.saw_running is True
-    assert published_payloads(node) == [{'id': 'cmd-own-move', 'is_completed': False}]
+    assert node.current_command_id is None
+    assert node.saw_running is False
+    assert published_payloads(node) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1157,15 +1177,18 @@ def test_external_return_home_id_conflict_with_rmf_dock_is_not_reported_as_succe
     assert node.last_command_result == CommandCompletion('cmd-dock', True, False, -8, 'external_preempted')
 
 
-def test_external_return_home_when_own_dispatch_never_bound_id_is_detected_as_external() -> None:
-    """A returnHome is treated as external when our own dock dispatch never bound a command_id.
+def test_missing_command_id_on_dispatch_fails_closed_instead_of_leaving_ownership_ambiguous() -> None:
+    """A dock dispatch whose StartCommand response carries no command_id fails closed immediately.
 
-    Defensive coverage for Issue #34 Plan §7.4 blocking-3: even if
-    StartCommandResponse carried no command_id (should not normally happen
-    once a stub-direct dispatch reports success), an unbound own
-    command_id must never be treated as plausibly ours -- unlike the
-    previous running_state_wait-window fallback, which assumed an unbound
-    id was ours for the whole window.
+    Rewritten for Codex re-review ISS34-037 blocking-1: the previous design
+    (Issue #34 Plan §7.4 blocking-3) left current_command_id unbound and
+    relied on downstream detection (monitor_external_control/publish_result)
+    to never mistake a later RUNNING command for this task's own via a
+    type/target match. That fallback has been removed entirely --
+    _execute_async_stub_dispatch now fails the task closed
+    (reason='missing_command_id') the moment StartCommand's success response
+    carries no command_id, so ownership is never left ambiguous to begin
+    with.
     """
     node = make_node(client_methods=['return_home', 'stub'])
     node.method_mapping = {'dock': 'return_home'}
@@ -1173,8 +1196,19 @@ def test_external_return_home_when_own_dispatch_never_bound_id_is_detected_as_ex
     node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response(command_id=None))
 
     node._execute_command({'id': 'cmd-dock-3', 'method': 'dock', 'args': {}})
-    assert node.current_command_id is None
 
+    assert node.current_command_id is None
+    assert node.task_id is None
+    assert published_payloads(node) == [{
+        'id': 'cmd-dock-3',
+        'is_completed': True,
+        'success': False,
+        'reason': 'missing_command_id',
+    }]
+
+    # A RUNNING command observed afterward is correctly treated as external
+    # while idle (no RMF task left to preempt) -- cmd-dock-3 was already
+    # failed closed and cannot be attributed to it.
     node._get_command_state_response = MagicMock(return_value={
         'commandId': 'ext-return-home-3',
         'state': 'COMMAND_STATE_RUNNING',
@@ -1189,7 +1223,7 @@ def test_external_return_home_when_own_dispatch_never_bound_id_is_detected_as_ex
         'id': 'cmd-dock-3',
         'is_completed': True,
         'success': False,
-        'reason': 'external_preempted',
+        'reason': 'missing_command_id',
     }]
     assert node.external_control_active is True
 
@@ -1271,18 +1305,20 @@ def test_start_command_success_and_id_bind_are_atomic_under_concurrent_monitor()
     assert node.current_command_id == 'own-dock-race-1'
 
 
-def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispatch_settles() -> None:
-    """monitor_external_control() defers while dispatching, but still catches the external command after.
+def test_dispatch_pending_snapshot_reconciled_as_external_even_after_it_ends() -> None:
+    """A RUNNING command observed only during the dispatch window is still caught by reconciliation.
 
-    Issue #34 Plan §5 dispatch-pending hold: while dispatching=True our own
-    command_id is not yet bound (_execute_async_stub_dispatch's gRPC call
-    runs outside _command_lock), so a concurrent monitor_external_control()
-    poll must not judge ownership yet -- it could misclassify our own
-    not-yet-bound dispatch as external. But deferring must not mean
-    permanently missing a genuinely external command: once the dispatch
-    settles and current_command_id is bound, the same external command_id
-    observed on the next poll must still be recognized and preempt/mark
-    busy immediately, not be silently dropped by having deferred once.
+    Issue #34 Plan §5 "remember snapshot.commandId for reconciliation": while
+    dispatching=True our own command_id is not yet bound
+    (_execute_async_stub_dispatch's gRPC call runs outside _command_lock), so
+    a concurrent monitor_external_control() poll must not judge ownership
+    yet -- it could misclassify our own not-yet-bound dispatch as external.
+    Deferring must not mean permanently missing a genuinely external
+    command, though: the external command here has already ended (per the
+    second GetCommandState response, taken after the dispatch settles), so
+    only the remembered snapshot -- not a fresh live poll -- can still catch
+    it (Codex re-review ISS34-037 non-blocking finding: the previous design
+    discarded the dispatch-time snapshot outright).
 
     Drives command dispatch (_execute_command) and detection
     (monitor_external_control) on real threads through their real code
@@ -1303,8 +1339,11 @@ def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispat
         return stub_start_command_response(command_id='own-dock-race-2')
 
     node.kachaka_client.stub.StartCommand = MagicMock(side_effect=racing_start_command)
-    node._get_command_state_response = MagicMock(
-        return_value={
+    # The external command is RUNNING only on the first (dispatch-time) poll;
+    # every later live poll finds the robot idle, so detection can only come
+    # from the remembered snapshot, never a fresh GetCommandState call.
+    node._get_command_state_response = MagicMock(side_effect=[
+        {
             'commandId': 'ext-during-dispatch',
             'state': 'COMMAND_STATE_RUNNING',
             'command': {
@@ -1312,7 +1351,12 @@ def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispat
                     'targetLocationId': 'home'
                 }
             },
-        })
+        },
+        {
+            'commandId': None,
+            'state': 'COMMAND_STATE_IDLE'
+        },
+    ])
 
     dispatch_thread = threading.Thread(
         target=node._execute_command,
@@ -1329,15 +1373,16 @@ def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispat
     asyncio.run(node.monitor_external_control())
     assert published_payloads(node) == []
     assert node.external_control_active is False
+    assert node._pending_dispatch_snapshot_id == 'ext-during-dispatch'
 
     proceed_with_grpc.set()
     dispatch_thread.join(timeout=2.0)
     assert not dispatch_thread.is_alive()
-    assert node.current_command_id == 'own-dock-race-2'
     assert node.dispatching is False
 
-    asyncio.run(node.monitor_external_control())
-
+    # Reconciliation ran synchronously inside _execute_command's finally
+    # block (not a fresh poll) and caught the now-ended external command,
+    # preempting the dispatch that raced it.
     assert published_payloads(node) == [{
         'id': 'cmd-dock-race-2',
         'is_completed': True,
@@ -1347,6 +1392,107 @@ def test_dispatch_pending_defers_external_detection_then_catches_it_after_dispat
     assert node.external_control_active is True
     assert node._external_command_id == 'ext-during-dispatch'
     assert node.task_id is None
+    assert node.current_command_id is None
+    assert node._pending_dispatch_snapshot_id is None
+
+    # A live poll now correctly reports idle, confirming the detection above
+    # came from the remembered snapshot, not this (or any) fresh poll.
+    asyncio.run(node.monitor_external_control())
+    assert node.external_control_active is False
+
+
+def test_missing_command_id_race_never_lets_publish_result_bind_external_success() -> None:
+    """Blocking-1 regression (Codex ISS34-037): a same-target external command can never poison a failed dispatch.
+
+    Reproduces the exact interleaving Codex's read-only simulation found,
+    with real threads: (1) monitor_external_control() runs first and finds
+    nothing external (idle robot) -- modeling "monitor completed" before the
+    race; (2) a separate thread dispatches move_to_pose via _execute_command
+    (command dispatch runs on its own thread in production, not the main
+    loop) -- the mocked stub.StartCommand reports success but returns an
+    empty command_id, the anomaly this fix must fail closed on; (3) once the
+    dispatch thread has published its failure completion, a same-target
+    external moveToPoseCommand appears RUNNING; (4) publish_result() must
+    never bind current_command_id to it or report its eventual success as
+    this (already-failed) task's own.
+
+    Before this fix, step (2) would have left current_command_id unbound
+    (only a warning logged) and the task still active; publish_result()'s
+    type/target fallback bind (removed in Step 2/3 of this change) would
+    then have bound the external command's id in step (4), and a later
+    success for it would have been reported as cmd-race-missing-id's own
+    success. Fail-closed dispatch (Step 3) means the task is already gone by
+    step (4), so there is nothing left to poison in the first place.
+    """
+    node = make_node(client_methods=['move_to_pose', 'stub'])
+    node.method_mapping = {}
+    node.grpc_connection_check = MagicMock(return_value=True)
+    node.map_state = MapState.initial().with_telemetry_map_name('L1')
+    node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response(command_id=None))
+
+    # (1) monitor_external_control() runs first, on an idle robot.
+    node._get_command_state_response = MagicMock(return_value={'commandId': None, 'state': 'COMMAND_STATE_IDLE'})
+    asyncio.run(node.monitor_external_control())
+    assert node.external_control_active is False
+
+    # (2) a separate thread dispatches move_to_pose; StartCommand succeeds
+    # but returns no command_id.
+    dispatch_thread = threading.Thread(
+        target=node._execute_command,
+        args=({
+            'id': 'cmd-race-missing-id',
+            'method': 'move_to_pose',
+            'args': {
+                'x': 1.0,
+                'y': 1.0,
+                'yaw': 0.0,
+                'map_name': 'L1'
+            },
+        },),
+    )
+    dispatch_thread.start()
+    dispatch_thread.join(timeout=2.0)
+    assert not dispatch_thread.is_alive()
+
+    failure_payload = {
+        'id': 'cmd-race-missing-id',
+        'is_completed': True,
+        'success': False,
+        'reason': 'missing_command_id',
+    }
+    # Fail-closed: the task was completed as a failure, never left dangling
+    # for a later poll to bind.
+    assert published_payloads(node) == [failure_payload]
+    assert node.task_id is None
+    assert node.current_command_id is None
+
+    # (3) a same-target external moveToPoseCommand now appears RUNNING.
+    node._get_command_state_response = MagicMock(
+        return_value={
+            'commandId': 'external-move-race-1',
+            'state': 'COMMAND_STATE_RUNNING',
+            'command': {
+                'moveToPoseCommand': {
+                    'x': 1.0,
+                    'y': 1.0,
+                    'yaw': 0.0
+                }
+            },
+        })
+
+    # (4) publish_result() has no active task to poll for -- it only
+    # re-publishes the already-failed completion for Pub/Sub reliability --
+    # so it must never bind current_command_id or report a new success.
+    asyncio.run(node.publish_result())
+    assert node.current_command_id is None
+    assert node.task_id is None
+    assert all(payload == failure_payload for payload in published_payloads(node))
+
+    # monitor_external_control() correctly reports the same command as
+    # external (idle, not attributed to cmd-race-missing-id) once polled.
+    asyncio.run(node.monitor_external_control())
+    assert node.external_control_active is True
+    assert node._external_command_id == 'external-move-race-1'
 
 
 def test_recently_completed_dock_return_home_is_not_treated_as_external() -> None:

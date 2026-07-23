@@ -71,6 +71,9 @@ class CommandCompletion:
         -7  : no motion progress within motion_progress timeout (reason='progress_timeout')
         -8  : preempted by an externally-triggered returnHome (reason='external_preempted')
         -9  : rejected while external control is active (reason='external_busy')
+        -10 : StartCommand succeeded but returned no command_id, so ownership
+              could not be captured; fail closed instead of binding by
+              command type/target (reason='missing_command_id')
     """
 
     task_id: str
@@ -322,6 +325,14 @@ class KachakaApiClientByZenoh:
         # publish_result skips polling then, so it can never pair the previous
         # command's result with the task being dispatched.
         self.dispatching = False
+        # commandId of a RUNNING command monitor_external_control() observed
+        # while dispatching=True deferred judgment (Issue #34 Plan §5
+        # "remember snapshot.commandId for reconciliation"): reconciled once
+        # the dispatch settles, so a genuinely external command that both
+        # starts and ends entirely within the dispatch window is still
+        # detected instead of silently missed (Codex re-review ISS34-037
+        # non-blocking finding).
+        self._pending_dispatch_snapshot_id: Optional[str] = None
         # Monotonic time of last observed progress (accept or RUNNING) for the
         # active task; drives the completion watchdog.
         self.last_progress_at: Optional[float] = None
@@ -474,15 +485,14 @@ class KachakaApiClientByZenoh:
         return False
 
     def _update_current_command_id(self, response: Optional[Dict[str, Any]], method_name: str) -> None:
-        """Extract and store command_id for async commands if available."""
-        if not isinstance(response, dict):
-            return
-        command_id = response.get('commandId')
-        if command_id:
-            self.current_command_id = command_id
-            self.logger.debug(f'Captured command_id {command_id} for {method_name}')
-        else:
-            self.logger.warning(f'Async command {method_name} did not return commandId; awaiting state update')
+        """Bind current_command_id from a StartCommand response known to carry a non-empty commandId.
+
+        Callers must already have fail-closed a missing/empty commandId
+        (Codex re-review ISS34-037 blocking-1); this only performs the bind.
+        """
+        command_id = response.get('commandId') if isinstance(response, dict) else None
+        self.current_command_id = command_id
+        self.logger.debug(f'Captured command_id {command_id} for {method_name}')
 
     def _running_state_wait_expired(self) -> bool:
         """Return True when waiting for RUNNING has exceeded the configured timeout."""
@@ -578,69 +588,18 @@ class KachakaApiClientByZenoh:
     def _observed_command_type_matches_expected(self, command_dict: Optional[Dict[str, Any]]) -> bool:
         """Return True when an observed Kachaka command payload's type matches expected_kachaka_method.
 
-        Used to gate the first bind of current_command_id (Issue #34 Plan
-        §7.3): a RUNNING/result command of the wrong type must never be bound
-        to the active RMF task, even before any command_id has been bound.
+        Used by _validate_command_match() to confirm a completed command's
+        type actually matches what was dispatched before its success is
+        reported to RMF (Issue #34 Plan §7.3). Ownership (which command_id
+        this task's polling should follow) is decided solely by command_id
+        equality against the id captured at dispatch (Codex re-review
+        ISS34-037 blocking-1) -- command type/target are never used to bind
+        an unconfirmed command_id.
         """
         expected_field = self.COMMAND_TYPE_FIELD.get(self.expected_kachaka_method or '')
         if expected_field is None:
             return True
         return isinstance(command_dict, dict) and expected_field in command_dict
-
-    def _observed_move_target_matches_dispatch(self, command_dict: Optional[Dict[str, Any]]) -> bool:
-        """Return True when an observed moveToPoseCommand's own target matches what we dispatched.
-
-        Type match alone cannot distinguish our own move_to_pose from a
-        same-type command started by someone else (or a stale one):
-        Kachaka's async StartCommand never returns commandId synchronously
-        (KachakaApiClient.start_command discards it when wait_for_completion
-        is False), so before a command_id is bound, only the observed
-        command's own x/y/yaw -- not just its type -- can confirm it is the
-        command we just sent (Codex re-review ISS34-010 blocking-2, Issue
-        #34 Plan §7.3). When command_target_pose was not set (dispatch did
-        not go through the move_to_pose branch), there is nothing to compare
-        against and the check is skipped so type-only matching still applies.
-        """
-        if self.command_target_pose is None:
-            return True
-        if not isinstance(command_dict, dict):
-            return False
-        observed = command_dict.get('moveToPoseCommand')
-        if not isinstance(observed, dict):
-            return False
-        distance = math.hypot(
-            observed.get('x', 0.0) - self.command_target_pose.x,
-            observed.get('y', 0.0) - self.command_target_pose.y,
-        )
-        yaw_diff = abs(self._normalize_angle(observed.get('yaw', 0.0) - self.command_target_pose.theta))
-        return distance <= self.command_match_distance_tolerance and yaw_diff <= self.command_match_yaw_tolerance
-
-    def _observed_command_confirmed_for_bind(self, command_dict: Optional[Dict[str, Any]]) -> bool:
-        """Return True when an observed command can be confirmed as the one we dispatched.
-
-        Combines the type-match gate with the move_to_pose target check so
-        every command_id-binding call site rejects a same-type command that
-        cannot be confirmed as ours, rather than binding on type alone
-        (Codex re-review ISS34-010 blocking-2, Issue #34 Plan §7.3).
-
-        Residual scope note (ISS34-036): this type/target confirmation is
-        only ever consulted by publish_result()'s first-bind path, reached
-        solely when current_command_id was never captured at dispatch (a
-        successful StartCommand response with no command_id) -- an anomaly
-        the stub-direct dispatch was specifically introduced to eliminate
-        (ISS34-002-fix3), so it should not occur in practice. If it ever
-        does and a same-type/target external command races it, monitor_
-        external_control() still runs first every main loop iteration and
-        polls independently; ownership here is decided by type/target, not
-        by the bounded own-id set _is_own_command_id() uses. Removing this
-        path entirely (fail the task via command_start_timeout instead of
-        ever binding without a captured id) was considered but left out of
-        this change's scope to avoid destabilizing the ISS34-006/ISS34-010
-        binding behavior these type/target checks were reviewed for.
-        """
-        if not self._observed_command_type_matches_expected(command_dict):
-            return False
-        return self._observed_move_target_matches_dispatch(command_dict)
 
     def _record_motion_progress_baseline(self) -> None:
         """Reset the motion_progress baseline to the current pose and time."""
@@ -795,6 +754,30 @@ class KachakaApiClientByZenoh:
         self.external_control_active = False
         self._external_command_id = None
 
+    def _reconcile_pending_dispatch_snapshot(self) -> None:
+        """Reconcile a RUNNING command_id observed while a dispatch was in flight.
+
+        Must be called holding self._command_lock, once a dispatch has fully
+        settled (dispatching just flipped back to False) and StartCommand's
+        response has already been fail-closed or bound. monitor_external_control()
+        defers judgment while dispatching=True and instead remembers the last
+        RUNNING command_id it saw (Issue #34 Plan §5 "remember
+        snapshot.commandId for reconciliation"); check that id against
+        ownership now, using the same rule monitor_external_control() itself
+        uses, so a transient external command that started and ended entirely
+        within the dispatch window (and would therefore be invisible to any
+        later live poll) is still detected rather than silently dropped
+        (Codex re-review ISS34-037 non-blocking finding).
+        """
+        snapshot_id = self._pending_dispatch_snapshot_id
+        self._pending_dispatch_snapshot_id = None
+        if snapshot_id is None or self._is_own_command_id(snapshot_id):
+            return
+        if not self.external_control_active:
+            self._handle_external_command_started(snapshot_id)
+        elif snapshot_id != self._external_command_id:
+            self._external_command_id = snapshot_id
+
     async def monitor_external_control(self) -> None:
         """Detect Kachaka commands not issued by this bridge (Issue #34 Plan §5).
 
@@ -820,6 +803,10 @@ class KachakaApiClientByZenoh:
             return
 
         with self._command_lock:
+            command_dict = state_res.get('command')
+            is_running = self._is_running_state(state_res.get('state'))
+            observed_id = state_res.get('commandId')
+
             if self.dispatching:
                 # A dispatch is in flight and has not yet synchronously bound
                 # its own command_id (_execute_async_stub_dispatch runs the
@@ -828,12 +815,15 @@ class KachakaApiClientByZenoh:
                 # not-yet-bound dispatch as external; defer to the next poll,
                 # by which point the dispatch has either bound
                 # current_command_id or failed and reset task_id (Issue #34
-                # Plan §5 dispatch-pending hold).
+                # Plan §5 dispatch-pending hold). Remember this snapshot so
+                # _reconcile_pending_dispatch_snapshot() can still catch a
+                # genuinely external command once the dispatch settles, even
+                # if it has already ended by the next live poll (Codex
+                # re-review ISS34-037 non-blocking finding).
+                if is_running and observed_id is not None:
+                    self._pending_dispatch_snapshot_id = observed_id
                 return
 
-            command_dict = state_res.get('command')
-            is_running = self._is_running_state(state_res.get('state'))
-            observed_id = state_res.get('commandId')
             is_external_now = is_running and observed_id is not None and not self._is_own_command_id(observed_id)
 
             if is_external_now:
@@ -1074,41 +1064,33 @@ class KachakaApiClientByZenoh:
                 self.logger.debug(f'GetCommandState response: {state_res}')
                 command_id = state_res.get('commandId')
                 state_value = state_res.get('state')
-                command_dict = state_res.get('command') if isinstance(state_res, dict) else None
 
                 if self.is_async_command and not self.saw_running and self._command_start_timeout_expired():
                     self._handle_async_timeout(error_code=-6, reason='start_timeout')
                     return
 
                 if self.is_async_command:
-                    if (self.current_command_id is None and self._is_running_state(state_value) and
-                            not self._observed_command_confirmed_for_bind(command_dict)):
-                        # A RUNNING command that cannot be confirmed as ours (wrong
-                        # type, or for move_to_pose a mismatched target) must never
-                        # be bound to this task, even before any command_id has been
-                        # bound (Issue #34 Plan §7.3, Codex review ISS34-006/ISS34-010
-                        # blocking findings).
+                    if self.current_command_id is None:
+                        # Ownership is bound exclusively by StartCommand's response
+                        # command_id, captured synchronously at dispatch
+                        # (_execute_async_stub_dispatch). A fail-closed dispatch
+                        # (Issue #34 Plan §7.3/§7.4, Codex re-review ISS34-037
+                        # blocking-1) never leaves this unbound while a task is
+                        # active, so reaching here means the invariant was
+                        # violated upstream; never treat an unconfirmed RUNNING
+                        # command as progress on our task in that case (matching
+                        # command type/target used to be accepted as an ownership
+                        # proof here, but a same-type/target external command
+                        # racing an ID-less dispatch could poison it).
                         self.logger.debug(
-                            'Ignoring RUNNING command_id %s for task %s: not confirmed as ours (expected %s)',
-                            command_id,
+                            'Task %s has no bound command_id; ignoring observed command_id %s',
                             self.task_id,
-                            self.expected_kachaka_method,
+                            command_id,
                         )
                         return
-                    if command_id:
-                        if self.current_command_id is None and self._is_running_state(state_value):
-                            self.current_command_id = command_id
-                            self._ignored_result_count = 0
-                            self.logger.debug(f'Bound command_id {command_id} to task {self.task_id}')
-                        elif self.current_command_id and command_id != self.current_command_id:
-                            self._note_ignored_mismatch('command state', command_id)
-                            return
-                    else:
-                        self.logger.debug(
-                            'Command state missing commandId for task %s (state=%s)',
-                            self.task_id,
-                            state_value,
-                        )
+                    if command_id and command_id != self.current_command_id:
+                        self._note_ignored_mismatch('command state', command_id)
+                        return
 
                 if self._is_running_state(state_value):
                     self.saw_running = True
@@ -1128,39 +1110,21 @@ class KachakaApiClientByZenoh:
                     self._publish_to_zenoh(self.command_is_completed_pub, result.as_payload())
                     return
 
-                if self.is_async_command and not self.saw_running:
-                    if (self.current_command_id is None and command_id and self._running_state_wait_expired() and
-                            self._observed_command_confirmed_for_bind(command_dict)):
-                        self.current_command_id = command_id
-                        self._log_warning(f'RUNNING state was not observed within {self.running_state_wait}s; '
-                                          f'falling back to command_id={command_id} for task {self.task_id}')
-                    elif self.current_command_id is None:
-                        self.logger.debug('Async command: waiting to see RUNNING state first')
-                        return
+                if self.is_async_command and not self.saw_running and not self._running_state_wait_expired():
+                    self.logger.debug('Async command: waiting to see RUNNING state first')
+                    return
 
                 last_result = self._get_last_command_result_response()
                 # Both GetCommandState and GetLastCommandResult succeeded; reset stuck timer.
                 self._first_grpc_failure_time = None
                 self.logger.debug(f'GetLastCommandResult response: {last_result}')
                 result_command_id = last_result.get('commandId')
-                result_command_dict = last_result.get('command') if isinstance(last_result, dict) else None
 
-                if self.is_async_command:
-                    if (self.current_command_id is None and self.saw_running and result_command_id and
-                            not self._observed_command_confirmed_for_bind(result_command_dict)):
-                        self._log_warning(f'Ignoring result command_id {result_command_id} for task {self.task_id}: '
-                                          f'not confirmed as ours (expected {self.expected_kachaka_method})')
-                        return
-                    if result_command_id:
-                        if self.current_command_id is None and self.saw_running:
-                            self.current_command_id = result_command_id
-                            self._ignored_result_count = 0
-                            self.logger.debug(f'Bound result command_id {result_command_id} to task {self.task_id}')
-                        elif self.current_command_id and result_command_id != self.current_command_id:
-                            self._note_ignored_mismatch('result', result_command_id)
-                            return
-                    else:
-                        self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
+                if self.is_async_command and result_command_id and result_command_id != self.current_command_id:
+                    self._note_ignored_mismatch('result', result_command_id)
+                    return
+                if self.is_async_command and not result_command_id:
+                    self.logger.debug(f'Last command result missing commandId for task {self.task_id}')
 
                 cmd_result = last_result.get('result')
                 if not isinstance(cmd_result, dict):
@@ -1584,6 +1548,7 @@ class KachakaApiClientByZenoh:
                 finally:
                     with self._command_lock:
                         self.dispatching = False
+                        self._reconcile_pending_dispatch_snapshot()
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
             self._log_error_msg(f'Invalid command: {str(e)}')
             if new_task_id:
@@ -1819,7 +1784,27 @@ class KachakaApiClientByZenoh:
             success = result_dict.get('success', False)
             error_code = result_dict.get('errorCode', 0)
 
-            if success:
+            if success and not response_dict.get('commandId'):
+                # Fail closed instead of leaving current_command_id unbound.
+                # Kachaka API 3.14.4.0's StartCommandResponse normally
+                # carries a non-empty command_id on success, and the
+                # client wrapper itself relies on it; an empty id here is an
+                # anomaly, not routine behavior. The previous design let
+                # publish_result() bind ownership later by matching the
+                # observed command's type/target instead, but a same-
+                # type/target external command racing this dispatch could
+                # bind onto it and have its success misreported as this
+                # task's own (Codex re-review ISS34-037 blocking-1). Never
+                # bind without a captured id; fail the task immediately so
+                # the fleet adapter can retry/replan instead of waiting on
+                # a command we can no longer distinguish from anyone else's.
+                self._log_error_msg(
+                    f'StartCommand for {method_name} succeeded but returned no command_id; failing closed')
+                self._publish_command_completion(success=False,
+                                                 error_code=-10,
+                                                 task_id=task_id,
+                                                 reason='missing_command_id')
+            elif success:
                 # Origin of the command_start timeout is dispatch success
                 # (here), not command acceptance in _execute_command, so a
                 # slow grpc_connection_check above does not eat into the

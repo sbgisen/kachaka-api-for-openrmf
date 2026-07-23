@@ -1096,20 +1096,26 @@ class KachakaApiClientByZenoh:
                             command_id,
                         )
                         return
-                    if command_id != self.current_command_id:
+                if self._is_running_state(state_value):
+                    if self.is_async_command and command_id != self.current_command_id:
                         # A required exact match, not just a mismatch check
                         # when both sides are non-empty: an empty/missing
                         # commandId here must never be treated as "still
                         # ours". Kachaka API 3.14.4.0's own client wrapper
                         # requires result.command_id == response.command_id
                         # while waiting for completion, so a genuinely
-                        # RUNNING/completed own command is expected to keep
-                        # reporting a non-empty id (Codex re-review
-                        # ISS34-040 blocking-A).
+                        # RUNNING own command is expected to keep reporting
+                        # a non-empty id (Codex re-review ISS34-040
+                        # blocking-A). This check only gates RUNNING being
+                        # accepted as our own progress; a non-RUNNING state
+                        # (e.g. Kachaka's observed post-completion
+                        # COMMAND_STATE_PENDING/id-less transition, Codex
+                        # re-review ISS34-042) must fall through to
+                        # GetLastCommandResult below instead of returning
+                        # here, since completion ownership is judged by the
+                        # result commandId match, not the state one.
                         self._note_ignored_mismatch('command state', command_id)
                         return
-
-                if self._is_running_state(state_value):
                     self.saw_running = True
                     self.last_progress_at = time.monotonic()
                     self._ignored_result_count = 0

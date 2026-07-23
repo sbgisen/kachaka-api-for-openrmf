@@ -740,6 +740,53 @@ def test_final_pose_mismatch_is_not_reported_as_success() -> None:
     assert published_payloads(node) == [{'id': 'cmd-pose', 'is_completed': True, 'success': False}]
 
 
+def test_state_pending_with_missing_id_still_reports_success_via_last_result() -> None:
+    """A normal completion observed as PENDING/missing state commandId must still reach GetLastCommandResult.
+
+    Codex re-review ISS34-042: publish_result() required an exact state
+    commandId match before even checking whether the state was RUNNING,
+    so it returned early on every non-RUNNING poll -- including the normal
+    completion transition. Real hardware (ISS34-034 log analysis,
+    worker1_details_iss34-034.md rows #13-#14) shows Kachaka transitioning
+    to COMMAND_STATE_PENDING with an empty state commandId right after a
+    command finishes, while GetLastCommandResult still reports the
+    completed command's own commandId with success=True. Unlike
+    test_matching_command_type_and_floor_reports_success (which gives the
+    state poll a matching own id and therefore cannot detect this gap),
+    this test leaves the state commandId empty on purpose. The state-side
+    exact-match check must only gate RUNNING progress, not block reaching
+    GetLastCommandResult for completion ownership.
+    """
+    node = make_node()
+    node.task_id = 'cmd-normal'
+    node.is_async_command = True
+    node.saw_running = True
+    node.current_command_id = 'own-id-3'
+    node.expected_kachaka_method = 'move_to_pose'
+    node.command_target_map_name = '8F'
+    node.command_target_pose = Pose(1.0, 1.0, 0.0)
+    node.last_pose = Pose(1.0, 1.0, 0.0)
+    node.map_state = MapState.initial().with_telemetry_map_name('8F')
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': None,
+        'state': 'COMMAND_STATE_PENDING',
+    })
+    node._get_last_command_result_response = MagicMock(return_value={
+        'commandId': 'own-id-3',
+        'result': {
+            'success': True,
+            'errorCode': 0
+        },
+        'command': {
+            'moveToPoseCommand': {}
+        },
+    })
+
+    asyncio.run(node.publish_result())
+
+    assert published_payloads(node) == [{'id': 'cmd-normal', 'is_completed': True, 'success': True}]
+
+
 def test_bound_command_missing_state_command_id_is_not_treated_as_progress() -> None:
     """A RUNNING GetCommandState response missing commandId must not be accepted as our bound command.
 

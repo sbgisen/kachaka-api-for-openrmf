@@ -19,6 +19,27 @@ timeouts:
   grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
   grpc_stuck: 30.0          # Threshold (sec) for treating persistent Deadline Exceeded as a stuck channel
   command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
+  command_start: 15.0       # Max wait for RUNNING after an async command (move_to_pose/return_home) is dispatched
+  motion_progress: 30.0     # Max time with no position/yaw change while RUNNING before treated as stuck
+  own_return_home_retention: 5.0  # Grace period after any own async command completes during which a
+  # lingering RUNNING state with the same command_id is still recognized as ours, not external (concern (b))
+
+# Navigation tolerances (distances in meters, angles in radians)
+navigation:
+  # Set to true to enable the near-target short-circuit below (default off, see PR #48).
+  noop_enabled: false
+  # yamllint disable-line rule:line-length
+  noop_distance_tolerance: 0.15          # Below this + yaw tolerance, skip Kachaka move_to_pose and report success directly
+  noop_yaw_tolerance: 0.10
+  progress_distance_delta: 0.02          # Minimum position change counted as motion progress while RUNNING
+  progress_yaw_delta: 0.02               # Minimum yaw change counted as motion progress while RUNNING
+  # Tolerance used to confirm a Kachaka success result actually reached the RMF-requested
+  # target (see 7.3). Deliberately looser than noop_*: a real Kachaka move_to_pose success
+  # can land 0.2-0.3m from the exact target, so a tight tolerance here would turn legitimate
+  # successes into spurious failures. Matches the order of magnitude fleet_adapter_zenoh's
+  # localize_guard uses for the same kind of "close enough" check.
+  command_match_distance_tolerance: 0.75
+  command_match_yaw_tolerance: 0.35
 
 intervals:
   command_check: 1.0        # How often to check for new commands

@@ -74,6 +74,11 @@ class CommandCompletion:
         -10 : StartCommand succeeded but returned no command_id, so ownership
               could not be captured; fail closed instead of binding by
               command type/target (reason='missing_command_id')
+        -11 : undock endpoint rejected (too close to another charge_station,
+              or too far from every configured lane;
+              reason='undock_endpoint_rejected')
+        -12 : the undock phase exceeded its total budget
+              (reason='undock_phase_timeout')
     """
 
     task_id: str
@@ -119,6 +124,35 @@ class MapState:
 
     def with_telemetry_map_name(self, map_name: str) -> 'MapState':
         return MapState(telemetry_map_name=map_name)
+
+
+@dataclass
+class UndockPhase:
+    """State of a two-phase undock-then-navigate command (Issue #51).
+
+    A single RMF task ID drives two Kachaka commands: phase 1 leaves the
+    dock, phase 2 performs the originally requested move (or is skipped when
+    the original target sits on the dock the robot just left). Both phases'
+    Kachaka command IDs are held here so _is_own_command_id() keeps
+    recognizing phase 1's command as ours across the phase boundary, instead
+    of betting that boundary on the own_return_home_retention grace period.
+
+    Transitions: UNDOCKING -> NAVIGATING | SKIP_ORIGINAL -> FINAL. Only FINAL
+    may report success to RMF (see _publish_command_completion).
+    """
+
+    UNDOCKING = 'UNDOCKING'
+    NAVIGATING = 'NAVIGATING'
+    SKIP_ORIGINAL = 'SKIP_ORIGINAL'
+    FINAL = 'FINAL'
+
+    task_id: str
+    original_command: Dict[str, Any]
+    skip_original: bool
+    started_at: float
+    phase: str = UNDOCKING
+    phase1_command_id: Optional[str] = None
+    phase2_command_id: Optional[str] = None
 
 
 class KachakaApiClientByZenoh:
@@ -174,6 +208,29 @@ class KachakaApiClientByZenoh:
     command_target_pose: Optional[Pose]
     external_control_active: bool
     own_return_home_retention: float
+
+    # Undock prefix settings (Issue #51). Defined at class level so an
+    # instance built without __init__ (tests, tooling) has the feature off
+    # and behaves exactly as before rather than raising AttributeError.
+    undock_enabled = False
+    undock_distance_m = 0.5
+    undock_dock_radius_m = 0.5
+    undock_other_dock_vicinity_m = 0.5
+    undock_lane_tolerance_m = 0.3
+    undock_start_timeout = 15.0
+    undock_progress_timeout = 30.0
+    undock_phase_timeout = 45.0
+    undock_chargers: List[Dict[str, Any]] = ()
+    undock_lanes: List[Dict[str, Any]] = ()
+    # Active two-phase undock command, or None when no undock is in flight.
+    _undock: Optional[UndockPhase] = None
+
+    # Allowed range for undock.distance_m: 1.0m would overshoot the 0.95m
+    # spacing between two adjacent docks, and anything at or below
+    # noop_distance_tolerance would "succeed" without the robot moving
+    # (Issue #51 defaults section).
+    UNDOCK_MIN_DISTANCE_M = 0.3
+    UNDOCK_MAX_DISTANCE_M = 0.6
 
     # Consecutive command_id mismatches logged before re-warning (own binding
     # is never undone by a mismatch -- see _note_ignored_mismatch).
@@ -261,6 +318,7 @@ class KachakaApiClientByZenoh:
         self.progress_yaw_delta = float(navigation.get('progress_yaw_delta', 0.02))
         self.command_match_distance_tolerance = float(navigation.get('command_match_distance_tolerance', 0.75))
         self.command_match_yaw_tolerance = float(navigation.get('command_match_yaw_tolerance', 0.35))
+        self._load_undock_config(config.get('undock', {}))
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
         self.command_max_retries = connection.get('command_max_retries', 2)
@@ -366,6 +424,8 @@ class KachakaApiClientByZenoh:
         # Codex review concern (b)).
         self._recently_completed_own_command_id: Optional[str] = None
         self._recently_completed_own_command_until: Optional[float] = None
+        # Active two-phase undock command (Issue #51), or None.
+        self._undock: Optional[UndockPhase] = None
         # Monotonically increasing sequence number for the unified state
         # payload (Issue #34 Plan §5.1).
         self._state_seq = 0
@@ -629,13 +689,13 @@ class KachakaApiClientByZenoh:
         """Return True when RUNNING has not been observed within command_start_timeout."""
         if self.command_dispatched_at is None:
             return False
-        return (time.monotonic() - self.command_dispatched_at) >= self.command_start_timeout
+        return (time.monotonic() - self.command_dispatched_at) >= self._active_start_timeout()
 
     def _motion_progress_timeout_expired(self) -> bool:
         """Return True when the pose has not moved within motion_progress_timeout while RUNNING."""
         if self._motion_progress_at is None:
             return False
-        return (time.monotonic() - self._motion_progress_at) >= self.motion_progress_timeout
+        return (time.monotonic() - self._motion_progress_at) >= self._active_progress_timeout()
 
     def _attempt_cancel_active_command(self) -> None:
         """Best-effort cancel of the active Kachaka command on a start/progress timeout."""
@@ -696,6 +756,280 @@ class KachakaApiClientByZenoh:
 
         return True, None
 
+    def _load_undock_config(self, undock: Dict[str, Any]) -> None:
+        """Load the undock prefix settings (Issue #51).
+
+        Args:
+            undock (Dict[str, Any]): The ``undock`` section of config.yaml.
+        """
+        timeouts = undock.get('timeouts', {}) or {}
+        self.undock_enabled = bool(undock.get('enabled', False))
+        distance = float(undock.get('distance_m', 0.5))
+        clamped = min(max(distance, self.UNDOCK_MIN_DISTANCE_M), self.UNDOCK_MAX_DISTANCE_M)
+        if clamped != distance:
+            self.logger.warning('undock.distance_m %s is outside [%s, %s]; using %s', distance,
+                                self.UNDOCK_MIN_DISTANCE_M, self.UNDOCK_MAX_DISTANCE_M, clamped)
+        self.undock_distance_m = clamped
+        self.undock_dock_radius_m = float(undock.get('dock_radius_m', 0.5))
+        self.undock_other_dock_vicinity_m = float(undock.get('other_dock_vicinity_m', 0.5))
+        self.undock_lane_tolerance_m = float(undock.get('lane_tolerance_m', 0.3))
+        self.undock_start_timeout = float(timeouts.get('start', 15.0))
+        self.undock_progress_timeout = float(timeouts.get('progress', 30.0))
+        self.undock_phase_timeout = float(timeouts.get('phase_total', 45.0))
+        self.undock_chargers = list(undock.get('chargers', []) or [])
+        self.undock_lanes = list(undock.get('lanes', []) or [])
+
+    def _is_undock_phase1_active(self) -> bool:
+        """Return True while the undock (phase 1) move of the active task is in flight."""
+        undock = self._undock
+        return (undock is not None and undock.phase == UndockPhase.UNDOCKING and undock.task_id == self.task_id)
+
+    def _active_start_timeout(self) -> float:
+        """Return the command_start timeout that applies to the in-flight command."""
+        return self.undock_start_timeout if self._is_undock_phase1_active() else self.command_start_timeout
+
+    def _active_progress_timeout(self) -> float:
+        """Return the motion_progress timeout that applies to the in-flight command."""
+        return self.undock_progress_timeout if self._is_undock_phase1_active() else self.motion_progress_timeout
+
+    def _timeout_reason(self, reason: str) -> str:
+        """Prefix a timeout reason with ``undock_`` while the undock phase owns the command.
+
+        Undock reasons are excluded from the Kachaka-side navigation retry
+        (see _should_retry_command): retrying re-runs last_command as a
+        whole, which would repeat the departure move up to max_retries times
+        when an obstacle blocks it (Issue #51).
+        """
+        return f'undock_{reason}' if self._is_undock_phase1_active() else reason
+
+    def _undock_phase_timeout_expired(self) -> bool:
+        """Return True when the undock phase has exceeded its total budget."""
+        undock = self._undock
+        if undock is None or undock.phase != UndockPhase.UNDOCKING:
+            return False
+        return (time.monotonic() - undock.started_at) >= self.undock_phase_timeout
+
+    @staticmethod
+    def _point_segment_distance(x: float, y: float, start: List[float], end: List[float]) -> float:
+        """Return the distance from (x, y) to the segment start-end."""
+        sx, sy = float(start[0]), float(start[1])
+        ex, ey = float(end[0]), float(end[1])
+        dx, dy = ex - sx, ey - sy
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0.0:
+            return math.hypot(x - sx, y - sy)
+        ratio = max(0.0, min(1.0, ((x - sx) * dx + (y - sy) * dy) / length_sq))
+        return math.hypot(x - (sx + ratio * dx), y - (sy + ratio * dy))
+
+    def _configured_chargers(self, map_name: Optional[str]) -> List[Dict[str, Any]]:
+        """Return the configured charge_station entries for a map."""
+        return [c for c in self.undock_chargers if map_name is None or c.get('map_name') == map_name]
+
+    def _fetch_charger_poses(self, map_name: Optional[str]) -> List[Pose]:
+        """Return the charge_station poses, preferring the robot's own location list.
+
+        get_locations() is the first choice; the configured poses are used
+        only when the RPC fails or reports no charger (Issue #51). Kachaka
+        locations carry no map name -- they belong to the map the robot is
+        currently on, which the caller has already verified against the
+        requested map.
+
+        Args:
+            map_name (str, optional): The RMF-side map name of the command,
+                used to select the configured fallback entries.
+
+        Returns:
+            List[Pose]: The charger poses, or an empty list when none are known.
+        """
+        try:
+            response = self.kachaka_client.stub.GetLocations(pb2.GetRequest(), timeout=self.grpc_status_check_timeout)
+            charger_type = pb2.LocationType.Value('LOCATION_TYPE_CHARGER')
+            poses = [
+                Pose(loc.pose.x, loc.pose.y, loc.pose.theta) for loc in response.locations if loc.type == charger_type
+            ]
+            if poses:
+                return poses
+            self._log_warning('get_locations() reported no LOCATION_TYPE_CHARGER; falling back to configured poses')
+        except Exception as e:
+            self._log_error('Unexpected', '_fetch_charger_poses', e)
+
+        fallback = []
+        for entry in self._configured_chargers(map_name):
+            pose = entry.get('pose') or []
+            if len(pose) >= 2:
+                fallback.append(Pose(float(pose[0]), float(pose[1]), float(pose[2]) if len(pose) > 2 else 0.0))
+        return fallback
+
+    def _charger_override(self, charger: Pose, map_name: Optional[str]) -> Dict[str, Any]:
+        """Return the configured entry nearest to a charger pose, or an empty dict."""
+        best: Dict[str, Any] = {}
+        best_distance = self.undock_dock_radius_m
+        for entry in self._configured_chargers(map_name):
+            pose = entry.get('pose') or []
+            if len(pose) < 2:
+                continue
+            distance = math.hypot(charger.x - float(pose[0]), charger.y - float(pose[1]))
+            if distance <= best_distance:
+                best, best_distance = entry, distance
+        return best
+
+    def _fetch_battery_status(self) -> Optional[int]:
+        """Return the robot's power supply status enum, or None when it cannot be read."""
+        try:
+            response = self.kachaka_client.stub.GetBatteryInfo(pb2.GetRequest(),
+                                                               timeout=self.grpc_status_check_timeout)
+            return response.power_supply_status
+        except Exception as e:
+            self._log_error('Unexpected', '_fetch_battery_status', e)
+            return None
+
+    def _fetch_current_pose(self) -> Optional[Pose]:
+        """Return a freshly queried robot pose, or None when it cannot be read.
+
+        The undock move is aimed straight ahead of the *actual* body yaw
+        read immediately before dispatch, never at a lane heading: aiming at
+        the exit-lane heading is what produced the rotate-in-place command
+        the robot would not execute (Issue #51).
+        """
+        try:
+            response = self.kachaka_client.stub.GetRobotPose(pb2.GetRequest(), timeout=self.grpc_telemetry_timeout)
+            pose = Pose(response.pose.x, response.pose.y, response.pose.theta)
+            self.last_pose = pose
+            return pose
+        except Exception as e:
+            self._log_error('Unexpected', '_fetch_current_pose', e)
+            return None
+
+    def _evaluate_undock(
+        self,
+        map_name: Optional[str],
+        target_x: Optional[float],
+        target_y: Optional[float],
+    ) -> tuple:
+        """Decide whether a move_to_pose must be prefixed with an undock move (Issue #51).
+
+        Runs after the map guard and before the near-target no-op shortcut,
+        so a micro-rotation on the dock can never be short-circuited to
+        success while the robot is still on the charging contacts.
+
+        The robot counts as docked only when the battery status is not
+        DISCHARGING *and* it is within the dock radius of a charge_station:
+        either signal alone is ambiguous (a robot can idle next to a dock, and
+        UNSPECIFIED/NOT_CHARGING both occur on the contacts).
+
+        Any inability to judge (status RPC failure, no known charger pose,
+        unreadable pose) skips the prefix and dispatches the original command
+        unchanged, so a telemetry hiccup never turns into a failed task.
+
+        Args:
+            map_name (str, optional): The RMF-side map name of the command.
+            target_x (float, optional): The requested target x.
+            target_y (float, optional): The requested target y.
+
+        Returns:
+            tuple: ``('none', None)`` to dispatch the original command
+                unchanged, ``('reject', reason)`` to fail the command without
+                moving, or ``('prefix', (args, skip_original))`` with the
+                move_to_pose arguments of the departure move.
+        """
+        if not self.undock_enabled:
+            return 'none', None
+        if map_name is None or target_x is None or target_y is None:
+            self.logger.debug('Undock: command lacks map_name/target; skipping undock evaluation')
+            return 'none', None
+
+        status = self._fetch_battery_status()
+        if status is None:
+            self._log_warning('Undock: battery status unavailable; dispatching without undock prefix')
+            return 'none', None
+        if status == pb2.PowerSupplyStatus.Value('POWER_SUPPLY_STATUS_DISCHARGING'):
+            return 'none', None
+
+        pose = self._fetch_current_pose()
+        if pose is None:
+            self._log_warning('Undock: robot pose unavailable; dispatching without undock prefix')
+            return 'none', None
+
+        chargers = self._fetch_charger_poses(map_name)
+        if not chargers:
+            self._log_warning('Undock: no charge_station pose available; dispatching without undock prefix')
+            return 'none', None
+
+        departure = min(chargers, key=lambda c: math.hypot(pose.x - c.x, pose.y - c.y))
+        override = self._charger_override(departure, map_name)
+        dock_radius = float(override.get('dock_radius_m', self.undock_dock_radius_m))
+        if math.hypot(pose.x - departure.x, pose.y - departure.y) > dock_radius:
+            self.logger.debug('Undock: not charging on a dock (status=%s, nearest charger beyond %.2fm)', status,
+                              dock_radius)
+            return 'none', None
+
+        distance = float(override.get('distance_m', self.undock_distance_m))
+        endpoint_x = pose.x + distance * math.cos(pose.theta)
+        endpoint_y = pose.y + distance * math.sin(pose.theta)
+
+        for other in chargers:
+            if other is departure:
+                continue
+            if math.hypot(endpoint_x - other.x, endpoint_y - other.y) <= self.undock_other_dock_vicinity_m:
+                self._log_warning(f'Undock endpoint ({endpoint_x:.2f}, {endpoint_y:.2f}) is within '
+                                  f'{self.undock_other_dock_vicinity_m}m of another charge_station; refusing undock')
+                return 'reject', 'undock_endpoint_rejected'
+
+        lanes = [lane for lane in self.undock_lanes if lane.get('map_name') in (None, map_name)]
+        if lanes:
+            lane_distance = min(
+                self._point_segment_distance(endpoint_x, endpoint_y, lane.get('start', [0.0, 0.0]),
+                                             lane.get('end', [0.0, 0.0])) for lane in lanes)
+            if lane_distance > self.undock_lane_tolerance_m:
+                self._log_warning(f'Undock endpoint ({endpoint_x:.2f}, {endpoint_y:.2f}) is {lane_distance:.2f}m '
+                                  f'from the nearest lane (> {self.undock_lane_tolerance_m}m); refusing undock')
+                return 'reject', 'undock_endpoint_rejected'
+
+        # The original target sitting on the dock we are leaving is the core
+        # stuck-on-dock case: navigating back to it would re-enter the
+        # contacts and undock again on the next command (Issue #51).
+        skip_original = math.hypot(target_x - departure.x, target_y - departure.y) <= dock_radius
+        args = {'x': endpoint_x, 'y': endpoint_y, 'yaw': pose.theta}
+        self._log_info(f'Undock prefix: departing dock at ({departure.x:.2f}, {departure.y:.2f}) to '
+                       f'({endpoint_x:.2f}, {endpoint_y:.2f}) keeping yaw {pose.theta:.3f}; '
+                       f'skip_original={skip_original}')
+        return 'prefix', (args, skip_original)
+
+    async def _advance_undock_phase(self, task_id: str) -> None:
+        """Move a task from a completed undock (phase 1) to its final phase.
+
+        Called from publish_result() once phase 1 reported success, outside
+        _command_lock: the phase 2 dispatch takes _dispatch_lock and would
+        deadlock against a concurrent _execute_command if it ran while
+        holding the command lock.
+
+        Args:
+            task_id (str): The RMF task ID whose undock phase completed.
+        """
+        with self._command_lock:
+            undock = self._undock
+            if undock is None or undock.task_id != task_id or undock.phase != UndockPhase.UNDOCKING:
+                return
+            undock.phase = UndockPhase.SKIP_ORIGINAL if undock.skip_original else UndockPhase.NAVIGATING
+            skip_original = undock.skip_original
+            original_command = undock.original_command
+            self.last_progress_at = time.monotonic()
+
+        if skip_original:
+            self._log_info(f'Undock succeeded and the original target is on the dock just left; '
+                           f'completing task {task_id} without re-approaching it')
+            with self._command_lock:
+                if self._undock is not None and self._undock.task_id == task_id:
+                    self._undock.phase = UndockPhase.FINAL
+            self._publish_command_completion(success=True, error_code=0, task_id=task_id)
+            return
+
+        self._log_info(f'Undock succeeded; dispatching the original target for task {task_id}')
+        self._execute_command(original_command, expected_task_id=task_id, skip_undock=True)
+        with self._command_lock:
+            if self._undock is not None and self._undock.task_id == task_id:
+                self._undock.phase2_command_id = self.current_command_id
+
     def _is_own_command_id(self, observed_command_id: Optional[str]) -> bool:
         """Return True when a RUNNING command's id belongs to this bridge's own dispatch.
 
@@ -725,6 +1059,14 @@ class KachakaApiClientByZenoh:
         if observed_command_id is None:
             return False
         if self.current_command_id is not None and observed_command_id == self.current_command_id:
+            return True
+        undock = self._undock
+        if undock is not None and observed_command_id in (undock.phase1_command_id, undock.phase2_command_id):
+            # Phase-owned retention (Issue #51): phase 1's id stays ours until
+            # the undock context is cleared, so the gap between phase 1's
+            # completion and phase 2's bind never depends on
+            # own_return_home_retention being longer than the phase-boundary
+            # round trip.
             return True
         if (self._recently_completed_own_command_id is not None and
                 observed_command_id == self._recently_completed_own_command_id and
@@ -992,17 +1334,19 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
-    async def _handle_command_retry(self, task_id: str, error_code: int) -> bool:
+    async def _handle_command_retry(self, task_id: str, error_code: int, reason: Optional[str] = None) -> bool:
         """Handle retry logic for failed commands.
 
         Args:
             task_id: The task ID that produced the failed result
             error_code: The error code from the failed command
+            reason: The completion reason, when one applies. ``undock_*``
+                reasons are never retried (see _should_retry_command).
 
         Returns:
             True if retry was initiated (caller should return early), False otherwise
         """
-        should_retry = await self._should_retry_command(error_code)
+        should_retry = await self._should_retry_command(error_code, reason)
         if not should_retry:
             self._log_info(f'Error code {error_code} is not retriable')
             return False
@@ -1044,6 +1388,8 @@ class KachakaApiClientByZenoh:
         method_name = 'publish_result'
         retry_task_id: Optional[str] = None
         retry_error_code: Optional[int] = None
+        retry_reason: Optional[str] = None
+        undock_advance_task_id: Optional[str] = None
         try:
             with self._command_lock:
                 if not self.task_id:
@@ -1063,6 +1409,12 @@ class KachakaApiClientByZenoh:
                     self._publish_command_completion(success=False, error_code=-5)
                     return
 
+                if self._undock_phase_timeout_expired():
+                    self._log_error_msg(f'Undock phase for task {self.task_id} exceeded '
+                                        f'{self.undock_phase_timeout}s; failing the task')
+                    self._handle_async_timeout(error_code=-12, reason='undock_phase_timeout')
+                    return
+
                 if self.dispatching:
                     # A dispatch is running outside the lock; polling now could
                     # pair the previous command's result with the new task.
@@ -1074,7 +1426,7 @@ class KachakaApiClientByZenoh:
                 state_value = state_res.get('state')
 
                 if self.is_async_command and not self.saw_running and self._command_start_timeout_expired():
-                    self._handle_async_timeout(error_code=-6, reason='start_timeout')
+                    self._handle_async_timeout(error_code=-6, reason=self._timeout_reason('start_timeout'))
                     return
 
                 if self.is_async_command:
@@ -1121,7 +1473,7 @@ class KachakaApiClientByZenoh:
                     self._ignored_result_count = 0
                     self._check_motion_progress()
                     if self._motion_progress_timeout_expired():
-                        self._handle_async_timeout(error_code=-7, reason='progress_timeout')
+                        self._handle_async_timeout(error_code=-7, reason=self._timeout_reason('progress_timeout'))
                         return
                     result = CommandCompletion(
                         task_id=self.task_id,
@@ -1170,6 +1522,13 @@ class KachakaApiClientByZenoh:
                             success = False
                             error_code = -2 if mismatch_reason == 'map_mismatch' else -1
                             reason = mismatch_reason
+                    if not success and reason is None and self._is_undock_phase1_active():
+                        # Marks the failure as belonging to the departure move
+                        # so it is never re-run by the navigation retry
+                        # (Issue #51): a retry re-executes last_command as a
+                        # whole and would repeat the undock up to max_retries
+                        # times against the same obstacle.
+                        reason = 'undock_failed'
                     result = CommandCompletion(
                         task_id=self.task_id,
                         is_completed=True,
@@ -1181,13 +1540,28 @@ class KachakaApiClientByZenoh:
                     if success:
                         self._log_info(f'Command {self.task_id} succeeded')
                         self.retry_count = 0
+                        undock = self._undock
+                        if undock is not None and undock.task_id == self.task_id:
+                            if undock.phase == UndockPhase.UNDOCKING:
+                                # Phase 1 done: the task is not finished, so no
+                                # completion is published. The original move is
+                                # dispatched (or skipped) outside the lock.
+                                undock_advance_task_id = self.task_id
+                                self.last_progress_at = time.monotonic()
+                            else:
+                                undock.phase = UndockPhase.FINAL
                     else:
                         self._log_warning(f'Command {self.task_id} failed with error code {error_code}')
                         retry_task_id = self.task_id
                         retry_error_code = error_code
+                        retry_reason = reason
+
+            if undock_advance_task_id is not None:
+                await self._advance_undock_phase(undock_advance_task_id)
+                return
 
             if retry_task_id is not None and retry_error_code is not None:
-                if await self._handle_command_retry(retry_task_id, retry_error_code):
+                if await self._handle_command_retry(retry_task_id, retry_error_code, retry_reason):
                     return  # Retry initiated, don't publish yet
 
             with self._command_lock:
@@ -1249,15 +1623,23 @@ class KachakaApiClientByZenoh:
         except Exception as e:
             self._log_error('Unexpected', method_name, e)
 
-    async def _should_retry_command(self, error_code: int) -> bool:
+    async def _should_retry_command(self, error_code: int, reason: Optional[str] = None) -> bool:
         """Determine if a command should be retried based on its error code.
 
         Args:
             error_code (int): The error code from the failed command
+            reason (str, optional): The completion reason of the failure.
 
         Returns:
             bool: True if the command should be retried, False otherwise
         """
+        if reason is not None and reason.startswith('undock_'):
+            # The retry path re-executes last_command as a whole, which for a
+            # failed departure move means undocking again -- up to max_retries
+            # times against the same obstacle. The undock prefix is decided
+            # freshly on the next RMF command instead (Issue #51).
+            self.logger.info(f'Undock failure ({reason}); not retriable on Kachaka side')
+            return False
         # Negative error codes are internal signals to RMF (replan); never retry on Kachaka side.
         if error_code < 0:
             self.logger.info(f'Internal error code {error_code}; not retriable on Kachaka side')
@@ -1437,7 +1819,10 @@ class KachakaApiClientByZenoh:
         self._publish_command_completion(success=False, error_code=-2, task_id=task_id, reason='map_mismatch')
         return False
 
-    def _execute_command(self, command: Dict[str, Any], expected_task_id: Optional[str] = None) -> None:
+    def _execute_command(self,
+                         command: Dict[str, Any],
+                         expected_task_id: Optional[str] = None,
+                         skip_undock: bool = False) -> None:
         """Unified command execution logic.
 
         Command state transitions happen under _command_lock, but the heavy
@@ -1456,6 +1841,11 @@ class KachakaApiClientByZenoh:
             command: The command dict ({'id', 'method', 'args'}).
             expected_task_id: When set (retry path), abort the dispatch if the
                 active task changed in the meantime.
+            skip_undock: When True, do not evaluate the undock prefix and keep
+                the active undock context. Used for the phase 2 dispatch of a
+                command that has already left the dock (Issue #51); without it
+                the reset below would drop the phase context and the freshly
+                dispatched original move could be prefixed a second time.
         """
         method_name = 'execute_command'
         new_task_id: Optional[str] = None
@@ -1507,6 +1897,8 @@ class KachakaApiClientByZenoh:
                     self.last_command = command
                     self.last_command_result = None
                     self.current_command_id = None
+                    if not skip_undock:
+                        self._undock = None
                     self.is_async_command = False
                     self.saw_running = False
                     self.async_command_started_at = None
@@ -1551,6 +1943,22 @@ class KachakaApiClientByZenoh:
                         target_x = args.get('x')
                         target_y = args.get('y')
                         target_yaw = args.get('yaw', 0.0)
+                        # Undock decision runs after the map guard and before
+                        # the no-op shortcut, so a micro-rotation requested
+                        # while the robot is on the charging contacts can
+                        # never be short-circuited to success (Issue #51).
+                        if not skip_undock:
+                            decision, payload = self._evaluate_undock(map_name, target_x, target_y)
+                            if decision == 'reject':
+                                self._publish_command_completion(success=False,
+                                                                 error_code=-11,
+                                                                 task_id=new_task_id,
+                                                                 reason=payload)
+                                return
+                            if decision == 'prefix':
+                                undock_args, skip_original = payload
+                                self._dispatch_undock_phase(command, undock_args, skip_original, map_name, new_task_id)
+                                return
                         # map_name is required for the shortcut (a missing floor can
                         # never be confirmed) and the near-target check runs first
                         # since it is cheap; the fresh floor re-query only happens
@@ -1603,6 +2011,45 @@ class KachakaApiClientByZenoh:
             self._log_error('Unexpected', f'executing command {method_name}', e)
             if new_task_id:
                 self._publish_command_completion(success=False, error_code=-1, task_id=new_task_id)
+
+    def _dispatch_undock_phase(
+        self,
+        command: Dict[str, Any],
+        undock_args: Dict[str, Any],
+        skip_original: bool,
+        map_name: Optional[str],
+        task_id: Optional[str],
+    ) -> None:
+        """Start the departure move of a two-phase undock command (Issue #51).
+
+        The RMF task ID is unchanged: the adapter sees one command, and no
+        completion is published until the final phase (see
+        _publish_command_completion and _advance_undock_phase).
+
+        Args:
+            command (Dict[str, Any]): The original RMF command, replayed as
+                phase 2 unless the original target is on the dock being left.
+            undock_args (Dict[str, Any]): move_to_pose arguments of the
+                departure move.
+            skip_original (bool): True when the original target sits on the
+                dock being left, so phase 2 is skipped.
+            map_name (str, optional): The RMF-side map name of the command.
+            task_id (str, optional): The RMF task ID of the command.
+        """
+        with self._command_lock:
+            self._undock = UndockPhase(
+                task_id=task_id or '',
+                original_command=command,
+                skip_original=skip_original,
+                started_at=time.monotonic(),
+            )
+            self.expected_kachaka_method = 'move_to_pose'
+            self.command_target_map_name = map_name
+            self.command_target_pose = Pose(undock_args['x'], undock_args['y'], undock_args['yaw'])
+        self._execute_async_stub_dispatch('move_to_pose', undock_args, task_id=task_id)
+        with self._command_lock:
+            if self._undock is not None and self._undock.task_id == task_id:
+                self._undock.phase1_command_id = self.current_command_id
 
     def _execute_switch_map_sync(self, args: Dict[str, Any], task_id: Optional[str] = None) -> None:
         """Execute switch_map command synchronously.
@@ -2003,6 +2450,7 @@ class KachakaApiClientByZenoh:
         self.expected_kachaka_method = None
         self.command_target_map_name = None
         self.command_target_pose = None
+        self._undock = None
 
     def _reconstruct_kachaka_client(self) -> bool:
         """Recreate the KachakaApiClient to recover from a dead gRPC channel.
@@ -2063,6 +2511,21 @@ class KachakaApiClientByZenoh:
             if prev and prev.is_completed and prev.task_id == target_task_id:
                 self.logger.debug(f'Completion for task {target_task_id} already published; skipping duplicate')
                 return True
+
+            undock = self._undock
+            if undock is not None and undock.task_id == target_task_id and undock.phase != UndockPhase.FINAL:
+                if success:
+                    # Only the final phase may report the task as done: a
+                    # success published while the departure move is still the
+                    # active phase would tell RMF the whole navigation
+                    # finished at the undock endpoint (Issue #51).
+                    self._log_error_msg(f'Success completion for task {target_task_id} requested from non-final '
+                                        f'undock phase {undock.phase}; not publishing')
+                    return False
+                # A failure ends the task outright, so the phase is finalized
+                # here rather than dropped: withholding it would leave RMF
+                # waiting for the 180s completion watchdog.
+                undock.phase = UndockPhase.FINAL
 
             completion_result = CommandCompletion(
                 task_id=target_task_id,

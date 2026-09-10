@@ -1880,6 +1880,14 @@ class KachakaApiClientByZenoh:
                             command['args'] == self.last_command.get('args')):
                         self._log_info(f'Re-issued command matches in-flight task {self.task_id}; '
                                        f'adopting new ID {new_task_id} without re-execution')
+                        # The undock context is keyed by task ID, so it has to
+                        # follow the adopted ID. Left on the old one, phase 1's
+                        # success would be published as the whole navigation's
+                        # success and the original target would never be
+                        # dispatched (PR #54 review).
+                        if self._undock is not None and self._undock.task_id == self.task_id:
+                            self._undock.task_id = new_task_id or ''
+                            self._undock.original_command = command
                         self.task_id = new_task_id
                         self.last_command = command
                         self.last_progress_at = time.monotonic()

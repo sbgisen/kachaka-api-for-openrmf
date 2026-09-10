@@ -696,3 +696,24 @@ def test_configured_charger_pose_is_used_when_get_locations_fails() -> None:
 
     assert node._undock is not None
     assert math.isclose(node.command_target_pose.x, 0.5)
+
+
+def test_reissued_command_carries_the_undock_context_to_the_new_id() -> None:
+    """An ID adopted mid-undock must not orphan the phase context (PR #54 review).
+
+    Left on the old ID, phase 1's success is published as the whole task's
+    success and the original target is never dispatched.
+    """
+    node = active_undock_node()
+    reissued = move_command(task_id='task-2')
+
+    node._execute_command(reissued)
+
+    assert node.task_id == 'task-2'
+    assert node._undock is not None
+    assert node._undock.task_id == 'task-2'
+    assert node._undock.original_command['id'] == 'task-2'
+    assert node._undock.phase == UndockPhase.UNDOCKING
+    # The phase guard still owns the adopted ID, so no success leaks out.
+    assert node._publish_command_completion(success=True, error_code=0, task_id='task-2') is False
+    assert published_payloads(node) == []

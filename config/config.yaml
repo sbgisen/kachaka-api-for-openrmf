@@ -64,3 +64,33 @@ navigation_retry:
 
 # Optional: Custom Zenoh config file path
 # zenoh_config: "/path/to/zenoh.json5"
+
+# Undock prefix before the first move off a charging dock (Issue #51).
+# Disabled by default: with enabled=false the bridge behaves exactly as before
+# (no extra gRPC calls are made on the move_to_pose path).
+undock:
+  enabled: false
+  distance_m: 0.5           # Forward distance of the undock move; clamped to [0.3, 0.6]
+  dock_radius_m: 0.5        # "On the dock" radius around a charge_station pose
+  other_dock_vicinity_m: 0.5  # Reject the prefix if the undock endpoint lands this close to another dock
+  lane_tolerance_m: 0.3     # Reject the prefix if the endpoint is farther than this from every configured lane
+  timeouts:
+    start: 15.0             # Max wait for RUNNING after the undock move is dispatched
+    progress: 30.0          # Max time with no pose change while the undock move is RUNNING
+    phase_total: 45.0       # Hard cap on the whole undock phase
+  # Charge stations. Used as the charger-pose fallback when get_locations()
+  # cannot be read, and (matched by proximity) for per-dock overrides.
+  # Example:
+  #   - name: dock_a
+  #     map_name: 27F
+  #     pose: [1.0, 2.0, 0.0]
+  #     distance_m: 0.45      # optional per-dock override of undock.distance_m
+  #     dock_radius_m: 0.5    # optional per-dock override of undock.dock_radius_m
+  chargers: []
+  # Lane segments the undock endpoint must stay near. The bridge has no nav
+  # graph, so the relevant segments are listed explicitly. An empty list
+  # disables the lane check. Example:
+  #   - map_name: 27F
+  #     start: [1.0, 2.0]
+  #     end: [4.0, 2.0]
+  lanes: []

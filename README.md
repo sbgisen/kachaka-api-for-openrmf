@@ -100,6 +100,7 @@ Run the following lines to launch the Zenoh node for Kachaka.
 cd ~/kachaka_ws
 export KACHAKA_ACCESS_POINT=$KACHAKA_IP:26400
 export ZENOH_ROUTER_ACCESS_POINT=<access_point_of_the_zenoh_router>  # e.g. 192.168.1.1:7447
+export LOG_LEVEL=INFO  # recommended default; use DEBUG only while investigating an issue, not for routine operation
 pipenv run python /path/to/kachaka-api-for-openrmf/scripts/connect_openrmf_by_zenoh.py
 ```
 

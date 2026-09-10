@@ -20,6 +20,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import logging.handlers
 import math
 import os
 from pathlib import Path
@@ -276,11 +277,19 @@ class KachakaApiClientByZenoh:
                                if kachaka_access_point else KachakaApiClientWithKeepalive())
         self.robot_name = robot_name
         self.task_id = None
-        logging.basicConfig(
-            level=self.log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            filename='kachaka_api.log',
-        )
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.WARNING)
+        if not root_logger.handlers:
+            file_handler = logging.handlers.RotatingFileHandler('kachaka_api.log',
+                                                                maxBytes=50 * 1024 * 1024,
+                                                                backupCount=3)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            root_logger.addHandler(file_handler)
+        # Third-party libraries are noisy at DEBUG (e.g. asyncio's
+        # "Using selector: EpollSelector"); pin them to WARNING so only this
+        # app's own logger follows LOG_LEVEL.
+        for noisy_logger_name in ('asyncio', 'urllib3', 'zenoh'):
+            logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(self.log_level)
 

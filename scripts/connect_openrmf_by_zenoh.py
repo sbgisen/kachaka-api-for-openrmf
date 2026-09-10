@@ -20,6 +20,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 from pathlib import Path
@@ -276,10 +277,13 @@ class KachakaApiClientByZenoh:
                                if kachaka_access_point else KachakaApiClientWithKeepalive())
         self.robot_name = robot_name
         self.task_id = None
+        # RotatingFileHandler, not a plain filename: the Kachaka device shares a
+        # 2.9GB volume between /home/kachaka and /tmp, and an unrotated log filled
+        # it in three months, which stopped the whole startup stack (Issue #52).
         logging.basicConfig(
             level=self.log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            filename='kachaka_api.log',
+            handlers=[RotatingFileHandler('kachaka_api.log', maxBytes=20 * 1024 * 1024, backupCount=3)],
         )
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(self.log_level)

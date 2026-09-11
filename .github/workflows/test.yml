@@ -1,0 +1,30 @@
+name: Test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+jobs:
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install kachaka-api eclipse-zenoh pytest pyyaml
+
+      - name: Show installed versions
+        run: pip freeze | grep -E "kachaka|zenoh|pytest"
+
+      - name: Run unit tests
+        run: pytest test/ -v -m "not integration"

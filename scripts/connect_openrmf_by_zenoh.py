@@ -444,13 +444,15 @@ class KachakaApiClientByZenoh:
 
         Args:
             zenoh_router (str): The address of the Zenoh router to connect to,
-                in the format "ip:port".
+                in the format "ip:port" (plain TCP) or "<proto>/ip:port"
+                (e.g. "tls/192.168.1.100:7447" for an mTLS router).
 
         Returns:
             zenoh.Config: A Zenoh configuration object.
         """
         conf = zenoh.Config.from_file(self.zenoh_config) if self.zenoh_config is not None else zenoh.Config()
-        conf.insert_json5('connect/endpoints', json.dumps([f'tcp/{zenoh_router}']))
+        endpoint = zenoh_router if '/' in zenoh_router else f'tcp/{zenoh_router}'
+        conf.insert_json5('connect/endpoints', json.dumps([endpoint]))
         return conf
 
     async def run_method(self, method_name: str, args: Optional[Dict[str, Any]] = None) -> Any:  # noqa: ANN401

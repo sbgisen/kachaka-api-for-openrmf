@@ -62,7 +62,10 @@ navigation_retry:
   retry_on_error_types:     # Error types that trigger automatic retry
     - Error                 # Retriable errors (may succeed on retry)
 
-# Optional: Custom Zenoh config file path
+# Optional: Custom Zenoh config file path.
+# Use this to enable mTLS against the Zenoh router; see
+# config/zenoh_client_mtls.json5.example and set the router address with the
+# tls scheme (ZENOH_ROUTER_ACCESS_POINT=tls/<router-ip>:7447).
 # zenoh_config: "/path/to/zenoh.json5"
 
 # Undock prefix before the first move off a charging dock (Issue #51).

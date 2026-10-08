@@ -4,10 +4,9 @@
 // `zenoh_config` in config.yaml at it. Then set the router address with the
 // tls scheme, e.g. ZENOH_ROUTER_ACCESS_POINT=tls/192.168.1.100:7447
 //
-// Certificates are issued with certpaste (https://github.com/sbgisen/certpaste):
-//   certpaste request --san <this robot's IP>   # on the robot
-//   certpaste sign                              # on the CA host
-//   certpaste install                           # on the robot
+// Certificates are issued with certpaste (https://github.com/sbgisen/certpaste)
+// on the CA host and uploaded to the paths below. See "Connecting to an mTLS
+// router" in README.md.
 //
 // `connect/endpoints` is intentionally absent: connect_openrmf_by_zenoh.py
 // fills it in from ZENOH_ROUTER_ACCESS_POINT.

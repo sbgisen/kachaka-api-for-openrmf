@@ -157,17 +157,25 @@ When the Zenoh router requires mutual TLS, the robot needs its own certificate
 and a Zenoh config file that points at it.
 
 1. Issue a certificate for the robot with
-   [certpaste](https://github.com/sbgisen/certpaste). The private key stays on
-   the robot; only the CSR and the signed bundle are copied:
+   [certpaste](https://github.com/sbgisen/certpaste) on the CA host (the
+   machine holding `ca.key`), then upload the result. certpaste does not need
+   to be installed on the robot:
 
     ```bash
-    # on the robot
-    certpaste request --san <this robot's IP>   # copy the CSR block
-    # on the CA host (the machine holding ca.key)
-    certpaste sign                              # paste the CSR, copy the bundle
-    # back on the robot
-    certpaste install                           # paste the bundle
+    # on the CA host; use one directory per robot
+    D=~/zenoh-robots/<robot_name>
+    # --san is required; the router does not check it, so the robot name is fine
+    certpaste --dir $D request --san <robot_name> -o /tmp/<robot_name>.csr
+    certpaste sign /tmp/<robot_name>.csr -o /tmp/<robot_name>.bundle
+    certpaste --dir $D install /tmp/<robot_name>.bundle
+
+    # upload ca.crt / peer.crt / peer.key from $D to the robot
+    ssh -p 26500 kachaka@<kachaka_ip> mkdir -p /home/kachaka/sbgisen/certs
+    scp -P 26500 $D/ca.crt $D/peer.crt $D/peer.key kachaka@<kachaka_ip>:/home/kachaka/sbgisen/certs/
     ```
+
+   `peer.key` is the robot's private key. Delete the copy on the CA host
+   after uploading it.
 
 2. Copy `config/zenoh_client_mtls.json5.example` onto the robot, fix the
    certificate paths, and point `config/config.yaml` at it:

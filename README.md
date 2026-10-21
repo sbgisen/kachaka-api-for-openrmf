@@ -152,6 +152,50 @@ connection:
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 
+#### Connecting to an mTLS router
+
+When the Zenoh router requires mutual TLS, the robot needs its own certificate
+and a Zenoh config file that points at it.
+
+1. Issue a certificate for the robot with
+   [certpaste](https://github.com/sbgisen/certpaste) on the CA host (the
+   machine holding `ca.key`), then upload the result. certpaste does not need
+   to be installed on the robot:
+
+    ```bash
+    # on the CA host; use one directory per robot
+    D=~/zenoh-robots/<robot_name>
+    # --san is required; the router does not check it, so the robot name is fine
+    certpaste --dir $D request --san <robot_name> -o /tmp/<robot_name>.csr
+    certpaste sign /tmp/<robot_name>.csr -o /tmp/<robot_name>.bundle
+    certpaste --dir $D install /tmp/<robot_name>.bundle
+
+    # upload ca.crt / peer.crt / peer.key from $D to the robot
+    ssh -p 26500 kachaka@<kachaka_ip> mkdir -p /home/kachaka/sbgisen/certs
+    scp -P 26500 $D/ca.crt $D/peer.crt $D/peer.key kachaka@<kachaka_ip>:/home/kachaka/sbgisen/certs/
+    ```
+
+   `peer.key` is the robot's private key. Delete the copy on the CA host
+   after uploading it.
+
+2. Copy `config/zenoh_client_mtls.json5.example` onto the robot, fix the
+   certificate paths, and point `config/config.yaml` at it:
+
+    ```yaml
+    zenoh_config: "/home/kachaka/sbgisen/zenoh_client_mtls.json5"
+    ```
+
+3. Give the router address the `tls` scheme:
+
+    ```bash
+    export ZENOH_ROUTER_ACCESS_POINT=tls/192.168.1.1:7447
+    ```
+
+An address without a scheme (`192.168.1.1:7447`) keeps using plain TCP, so
+existing setups are unaffected. Note that `verify_name_on_connect` makes the
+robot check the dialed address against the router certificate's SAN — the
+router must be enrolled with every address robots use to reach it.
+
 ## Testing
 
 ### Command Testing Script

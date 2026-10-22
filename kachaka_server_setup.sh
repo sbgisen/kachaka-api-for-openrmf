@@ -58,9 +58,20 @@ trap 'jobs -p | xargs -r kill 2>/dev/null' EXIT
 wait -n
 EOF
 
-ssh -p $SSH_PORT kachaka@$KACHAKA_IP <<EOF
-pip install eclipse-zenoh
+# Install the Python packages the servers import. A fresh Playground ships
+# none of them, and a missing `uvicorn` kills the whole startup stack.
+# Keep a copy of the stock startup script the first time it is replaced.
+ssh -p $SSH_PORT kachaka@$KACHAKA_IP <<'EOF'
+set -e
+pip install kachaka-api fastapi uvicorn eclipse-zenoh
+export PATH=/home/kachaka/.local/bin:$PATH
+python3 -c "import kachaka_api, fastapi, uvicorn, zenoh"
+command -v uvicorn
 mkdir -p /home/kachaka/sbgisen
+if [ -f /home/kachaka/kachaka_startup.sh ] && [ ! -f /home/kachaka/kachaka_startup.sh.backup ] \
+   && ! grep -q "MODIFIED BY SBGISEN" /home/kachaka/kachaka_startup.sh; then
+  cp /home/kachaka/kachaka_startup.sh /home/kachaka/kachaka_startup.sh.backup
+fi
 EOF
 
 # Securely copy the server setup script and any additional scripts to the server.

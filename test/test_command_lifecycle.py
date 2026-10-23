@@ -2101,3 +2101,45 @@ def test_publish_state_discards_sample_on_grpc_error() -> None:
 
     assert published_state_payloads(node) == []
     assert node._state_seq == 0
+
+
+# ---------------------------------------------------------------------------
+# return_home on the dock: Kachaka's "already charged" is a success
+# ---------------------------------------------------------------------------
+
+
+def test_return_home_already_charged_is_reported_as_success() -> None:
+    """A dock command issued while the robot is already on the charger succeeds.
+
+    Kachaka answers return_home with error code 10267 ("It is already
+    charged", error_type Ignore) when it is already docked. The robot is
+    exactly where RMF wants it, so the task must complete successfully
+    instead of being retried and failed.
+    """
+    node = make_node(['stub', 'return_home'])
+    node.method_mapping = {'dock': 'return_home'}
+    node.grpc_connection_check = MagicMock(return_value=True)
+    node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response('grpc-dock'))
+
+    node._execute_command({'id': 'task-dock', 'method': 'dock', 'args': {}})
+    assert node.current_command_id == 'grpc-dock'
+
+    node.saw_running = True
+    node._get_command_state_response = MagicMock(return_value={
+        'commandId': 'grpc-dock',
+        'state': 'COMMAND_STATE_UNKNOWN',
+    })
+    node._get_last_command_result_response = MagicMock(return_value={
+        'commandId': 'grpc-dock',
+        'result': {
+            'success': False,
+            'errorCode': 10267,
+        },
+        'command': {
+            'returnHomeCommand': {}
+        },
+    })
+    asyncio.run(node.publish_result())
+
+    assert published_payloads(node) == [{'id': 'task-dock', 'is_completed': True, 'success': True}]
+    assert node.task_id is None

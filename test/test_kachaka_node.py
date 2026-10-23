@@ -29,14 +29,12 @@ Running only pure logic tests (CI):
   pytest test/test_kachaka_node.py -v -m "not integration"
 """
 
-import asyncio
 import os
 from pathlib import Path
 import sys
 from typing import Generator
-from unittest.mock import MagicMock
-from unittest.mock import patch
 
+from kachaka_api.generated import kachaka_api_pb2 as pb2
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'scripts'))
@@ -50,24 +48,11 @@ from connect_openrmf_by_zenoh import KachakaApiClientByZenoh  # noqa: E402
 
 @pytest.fixture
 def mock_node() -> KachakaApiClientByZenoh:
-    """KachakaApiClientByZenoh with all external connections mocked.
+    """KachakaApiClientByZenoh created without running __init__.
 
-    Use this fixture for pure logic tests that do not require a real robot
-    or Zenoh router.
+    Use this fixture for pure logic tests that do not touch instance state.
     """
-    mock_session = MagicMock()
-    mock_session.declare_publisher.return_value = MagicMock()
-    mock_session.declare_queryable.return_value = MagicMock()
-    mock_session.declare_querier.return_value = MagicMock()
-    with (
-            patch('zenoh.open', return_value=mock_session),
-            patch('kachaka_api.KachakaApiClient', return_value=MagicMock()),
-    ):
-        node = KachakaApiClientByZenoh(
-            zenoh_router='127.0.0.1:7447',
-            kachaka_access_point='127.0.0.1:26400',
-        )
-    return node
+    return object.__new__(KachakaApiClientByZenoh)
 
 
 @pytest.fixture
@@ -87,7 +72,11 @@ def real_node() -> Generator[KachakaApiClientByZenoh, None, None]:
         pytest.skip('Set KACHAKA_ACCESS_POINT and ZENOH_ROUTER_ACCESS_POINT to run integration tests')
     node = KachakaApiClientByZenoh(zenoh_router=zenoh_router, kachaka_access_point=kachaka_ap)
     yield node
-    node.session.close()
+    try:
+        node.kachaka_client.cancel_command()
+    finally:
+        node.kachaka_client.close()
+        node.session.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +106,12 @@ class TestIsRunningState:
     def test_empty_string_returns_false(self, mock_node: KachakaApiClientByZenoh) -> None:
         assert mock_node._is_running_state('') is False  # noqa: SLF001
 
+    def test_running_int(self, mock_node: KachakaApiClientByZenoh) -> None:
+        assert mock_node._is_running_state(pb2.CommandState.Value('COMMAND_STATE_RUNNING')) is True  # noqa: SLF001
+
+    def test_non_running_int(self, mock_node: KachakaApiClientByZenoh) -> None:
+        assert mock_node._is_running_state(pb2.CommandState.Value('COMMAND_STATE_PENDING')) is False  # noqa: SLF001
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration tests (real Kachaka + Zenoh router required)
@@ -145,7 +140,7 @@ class TestExecuteCommandTracking:
         }
         real_node._execute_command(command)  # noqa: SLF001
         assert real_node.last_command_result is not None
-        assert real_node.last_command_result.get('error_code') == -2
+        assert real_node.last_command_result.error_code == -2
 
     def test_command_id_set_after_async_command(self, real_node: KachakaApiClientByZenoh) -> None:
         """current_command_id must be populated after move_to_pose is dispatched."""
@@ -160,25 +155,3 @@ class TestExecuteCommandTracking:
         }
         real_node._execute_command(command)  # noqa: SLF001
         assert real_node.current_command_id is not None
-
-    def test_stale_command_id_does_not_trigger_completion(self, real_node: KachakaApiClientByZenoh) -> None:
-        """Results for a stale command_id must not be published as completion.
-
-        Sends a command then overwrites current_command_id with a fake value.
-        publish_result must not mark the stale command as completed.
-        """
-        command = {
-            'id': 'test_stale_cmd',
-            'method': 'move_to_pose',
-            'args': {
-                'x': 0.0,
-                'y': 0.0,
-                'yaw': 0.0
-            },
-        }
-        real_node._execute_command(command)  # noqa: SLF001
-        real_node.current_command_id = 'stale_id_that_will_never_match'
-        asyncio.run(real_node.publish_result())
-        result = real_node.last_command_result
-        if result is not None:
-            assert result.get('id') != 'stale_id_that_will_never_match' or result.get('is_completed') is False

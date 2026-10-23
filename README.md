@@ -50,6 +50,8 @@ export KACHAKA_IP=<ip_address_of_the_target_device>  # 192.168.128.30
 ./kachaka_server_setup.sh $KACHAKA_IP
 ```
 
+The script installs the Python packages the servers depend on (`kachaka-api`, `fastapi`, `uvicorn`, `eclipse-zenoh`) into the Playground, copies the scripts to `/home/kachaka/sbgisen`, and replaces `/home/kachaka/kachaka_startup.sh` so that the servers start at boot. A fresh Playground does not ship these packages, so this step is required even if you only use the REST API. The stock startup script is kept as `/home/kachaka/kachaka_startup.sh.backup`.
+
 After rebooting the device, you shall get a response by running commands such as the following.
 
 ```bash
@@ -58,6 +60,8 @@ curl http://$KACHAKA_IP:26502/kachaka/get_robot_pose
 curl http://$KACHAKA_IP:26502/kachaka/get_map_list
 # {"get_map_list":[{"name":"1F","id":"XXX"},{"name":"2F","id":"YYY"}]}
 ```
+
+If `curl` cannot connect, log in to the Playground (`ssh -p 26500 kachaka@$KACHAKA_IP`), check `/tmp/kachaka_startup.log`, and make sure `python3 -c "import kachaka_api, fastapi, uvicorn"` succeeds.
 
 ## Local development
 

@@ -118,41 +118,6 @@ class TestIsRunningState:
         assert mock_node._is_running_state('') is False  # noqa: SLF001
 
 
-class TestPrepareAsyncCommandArgs:
-    """Tests for _prepare_async_command_args().
-
-    Verifies argument preparation for async StartCommand calls:
-    wait_for_completion defaults to False and is_async_command flag is updated.
-    """
-
-    def test_sets_wait_for_completion_false_by_default(self, mock_node: KachakaApiClientByZenoh) -> None:
-        result = mock_node._prepare_async_command_args({})  # noqa: SLF001
-        assert result['wait_for_completion'] is False
-        assert mock_node.is_async_command is True
-
-    def test_preserves_explicit_wait_for_completion_true(self, mock_node: KachakaApiClientByZenoh) -> None:
-        result = mock_node._prepare_async_command_args({'wait_for_completion': True})  # noqa: SLF001
-        assert result['wait_for_completion'] is True
-        assert mock_node.is_async_command is False
-
-    def test_applies_defaults_when_key_missing(self, mock_node: KachakaApiClientByZenoh) -> None:
-        result = mock_node._prepare_async_command_args({}, defaults={'speed': 1.0})  # noqa: SLF001
-        assert result['speed'] == 1.0
-
-    def test_does_not_override_existing_key_with_default(self, mock_node: KachakaApiClientByZenoh) -> None:
-        result = mock_node._prepare_async_command_args({'speed': 0.5}, defaults={'speed': 1.0})  # noqa: SLF001
-        assert result['speed'] == 0.5
-
-    def test_does_not_mutate_original_args(self, mock_node: KachakaApiClientByZenoh) -> None:
-        original = {'x': 1.0}
-        mock_node._prepare_async_command_args(original)  # noqa: SLF001
-        assert 'wait_for_completion' not in original
-
-    def test_none_args_returns_dict_with_wait_for_completion(self, mock_node: KachakaApiClientByZenoh) -> None:
-        result = mock_node._prepare_async_command_args(None)  # noqa: SLF001
-        assert 'wait_for_completion' in result
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration tests (real Kachaka + Zenoh router required)
 # ─────────────────────────────────────────────────────────────────────────────

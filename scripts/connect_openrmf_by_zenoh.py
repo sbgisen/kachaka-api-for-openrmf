@@ -38,6 +38,11 @@ import yaml
 import zenoh
 
 
+# Kachaka answers return_home with this code while already on the charger
+# ("It is already charged", error_type Ignore).
+KACHAKA_ERROR_ALREADY_CHARGED = 10267
+
+
 @dataclass(frozen=True)
 class Pose:
     x: float
@@ -1527,6 +1532,14 @@ class KachakaApiClientByZenoh:
                     success = cmd_result.get('success', False)
                     error_code = cmd_result.get('errorCode', 0)
                     reason = None
+                    if (not success and error_code == KACHAKA_ERROR_ALREADY_CHARGED
+                            and self.expected_kachaka_method == 'return_home'):
+                        # The robot is already docked, which is exactly what the
+                        # dock command asked for; report the task as done.
+                        self._log_info(f'Command {self.task_id}: return_home refused with "already charged" '
+                                       f'({error_code}); robot is on the dock, treating as success')
+                        success = True
+                        error_code = 0
                     if success and self.is_async_command:
                         matched, mismatch_reason = self._validate_command_match(last_result)
                         if not matched:

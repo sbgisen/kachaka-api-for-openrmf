@@ -11,6 +11,14 @@ permissions:
   contents: read
 
 jobs:
+  linter:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: Linter
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: sbgisen/.github/.github/workflows/ros2_style.yaml@main
+
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest

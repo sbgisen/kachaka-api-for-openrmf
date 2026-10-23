@@ -17,17 +17,15 @@
 
 import io
 import os
-from typing import Any
-from typing import Dict
-from typing import Union
+from typing import Any, Dict, Union
 
-import kachaka_api
 from fastapi import BackgroundTasks
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from google._upb._message import RepeatedCompositeContainer
 from google.protobuf.json_format import MessageToDict
+import kachaka_api
 
 background_task_results: Dict[str, Any] = {}
 

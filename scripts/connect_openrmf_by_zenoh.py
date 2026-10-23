@@ -37,7 +37,6 @@ from kachaka_client_with_keepalive import KachakaApiClientWithKeepalive
 import yaml
 import zenoh
 
-
 # Kachaka answers return_home with this code while already on the charger
 # ("It is already charged", error_type Ignore).
 KACHAKA_ERROR_ALREADY_CHARGED = 10267

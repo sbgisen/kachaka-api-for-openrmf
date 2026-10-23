@@ -1531,8 +1531,8 @@ class KachakaApiClientByZenoh:
                     success = cmd_result.get('success', False)
                     error_code = cmd_result.get('errorCode', 0)
                     reason = None
-                    if (not success and error_code == KACHAKA_ERROR_ALREADY_CHARGED
-                            and self.expected_kachaka_method == 'return_home'):
+                    if (not success and error_code == KACHAKA_ERROR_ALREADY_CHARGED and
+                            self.expected_kachaka_method == 'return_home'):
                         # The robot is already docked, which is exactly what the
                         # dock command asked for; report the task as done.
                         self._log_info(f'Command {self.task_id}: return_home refused with "already charged" '

@@ -32,14 +32,11 @@ background_task_results: Dict[str, Any] = {}
 app = FastAPI()
 
 
-@app.on_event("startup")
+@app.on_event('startup')
 async def init_channel() -> None:
-    """
-    Initialize the Kachaka API client.
-    """
+    """Initialize the Kachaka API client."""
     global kachaka_client
-    kachaka_client = kachaka_api.aio.KachakaApiClient(
-        os.getenv("KACHAKA_ACCESS_POINT", "100.94.1.1:26400"))
+    kachaka_client = kachaka_api.aio.KachakaApiClient(os.getenv('KACHAKA_ACCESS_POINT', '100.94.1.1:26400'))
     await kachaka_client.update_resolver()
 
 
@@ -53,13 +50,9 @@ def convert_response(response: Any) -> Union[dict, list]:  # noqa: ANN401
     Returns:
         The response as a dictionary.
     """
-    if response.__class__.__module__ == "kachaka_api_pb2":
+    if response.__class__.__module__ == 'kachaka_api_pb2':
         return MessageToDict(response)
-    if (
-        isinstance(response, tuple)
-        or isinstance(response, list)
-        or isinstance(response, RepeatedCompositeContainer)
-    ):
+    if (isinstance(response, tuple) or isinstance(response, list) or isinstance(response, RepeatedCompositeContainer)):
         return [convert_response(r) for r in response]
     return response
 
@@ -80,13 +73,13 @@ async def run_method_or_404(attr: str, params: dict = {}, to_dict: bool = True) 
         HTTPException: If the method does not exist.
     """
     if not hasattr(kachaka_client, attr):
-        raise HTTPException(status_code=404, detail="Method not found")
+        raise HTTPException(status_code=404, detail='Method not found')
     method = getattr(kachaka_client, attr)
     response = await method(**params)
     return convert_response(response) if to_dict else response
 
 
-@app.get("/kachaka/{front_or_back}_camera_image.jpeg")
+@app.get('/kachaka/{front_or_back}_camera_image.jpeg')
 async def front_or_back_camera_image(front_or_back: str) -> StreamingResponse:
     """
     Get the latest image from the front or back camera.
@@ -100,16 +93,16 @@ async def front_or_back_camera_image(front_or_back: str) -> StreamingResponse:
     Raises:
         HTTPException: If the specified camera is not "front" or "back".
     """
-    if front_or_back not in ["front", "back"]:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    response = await run_method_or_404(f"get_{front_or_back}_camera_ros_compressed_image", to_dict=False)
+    if front_or_back not in ['front', 'back']:
+        raise HTTPException(status_code=404, detail='Camera not found')
+    response = await run_method_or_404(f'get_{front_or_back}_camera_ros_compressed_image', to_dict=False)
     image_data = response.data
     image_format = response.format
     image_bytes = io.BytesIO(image_data)
-    return StreamingResponse(image_bytes, media_type=f"image/{image_format}")
+    return StreamingResponse(image_bytes, media_type=f'image/{image_format}')
 
 
-@app.get("/kachaka/{method:path}")
+@app.get('/kachaka/{method:path}')
 async def get(method: str) -> dict:
     """
     Run a GET method on the Kachaka API client.
@@ -123,7 +116,7 @@ async def get(method: str) -> dict:
     return {method: await run_method_or_404(method)}
 
 
-@app.post("/kachaka/{method:path}")
+@app.post('/kachaka/{method:path}')
 async def post(method: str, params: dict, background_tasks: BackgroundTasks) -> dict:
     """
     Run a POST method on the Kachaka API client as a background task.
@@ -136,17 +129,17 @@ async def post(method: str, params: dict, background_tasks: BackgroundTasks) -> 
     Returns:
         A dictionary containing the task ID.
     """
-    task_id = f"{method}_{id(params)}"
+    task_id = f'{method}_{id(params)}'
 
     async def background_task() -> None:
         result = await run_method_or_404(method, params)
         background_task_results[task_id] = result
 
     background_tasks.add_task(background_task)
-    return {"id": f"{task_id}"}
+    return {'id': f'{task_id}'}
 
 
-@app.get("/command_result")
+@app.get('/command_result')
 def get_command_result(task_id: str) -> dict:
     """
     Get the result of a background task.
@@ -162,5 +155,5 @@ def get_command_result(task_id: str) -> dict:
     """
     result = background_task_results.get(task_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Task not found or not completed")
+        raise HTTPException(status_code=404, detail='Task not found or not completed')
     return result

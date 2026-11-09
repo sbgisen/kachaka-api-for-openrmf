@@ -568,3 +568,113 @@ def test_dry_run_reissue_adopts_new_id_and_still_completes() -> None:
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{'id': 'cmd-dock-2', 'is_completed': True, 'success': True}]
     assert node._dry_run_moving_shelf_id == 'S1'
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (Issue #58 N1-N3): config, boundaries, nearest shelf, undock memory
+# ---------------------------------------------------------------------------
+
+FULL_SECTION = {
+    'front_distance_min': 0.1,
+    'front_distance_max': 2.0,
+    'front_yaw_tolerance': 0.5,
+    'front_yaw_offset': 1.0,
+    'at_location_tolerance': 0.6,
+    'match_radius': 0.7,
+}
+
+
+def test_shelf_precheck_config_values_are_applied() -> None:
+    node = make_node()
+    node._load_shelf_precheck_config(dict(FULL_SECTION))
+    for key, value in FULL_SECTION.items():
+        assert getattr(node, f'shelf_{key}') == value
+
+
+def test_shelf_precheck_config_keeps_defaults_for_missing_keys() -> None:
+    node = make_node()
+    node._load_shelf_precheck_config({})
+    assert node.shelf_front_distance_max == 1.2
+    assert node.shelf_match_radius == 0.3
+
+
+@pytest.mark.parametrize('section, key', [
+    (None, 'shelf_precheck'),
+    ({
+        'front_yaw_tolerance': 'abc'
+    }, 'front_yaw_tolerance'),
+    ({
+        'front_yaw_tolerance': None
+    }, 'front_yaw_tolerance'),
+    ({
+        'match_radius': -0.1
+    }, 'match_radius'),
+    ({
+        'at_location_tolerance': float('nan')
+    }, 'at_location_tolerance'),
+    ({
+        'match_radius': float('inf')
+    }, 'match_radius'),
+    ({
+        'front_distance_min': 1.5,
+        'front_distance_max': 1.0
+    }, 'front_distance_min'),
+])
+def test_shelf_precheck_config_rejects_bad_values(section: object, key: str) -> None:
+    node = make_node()
+    with pytest.raises(ValueError, match=key):
+        node._load_shelf_precheck_config(section)
+    assert node.shelf_match_radius == 0.3  # nothing applied
+
+
+# Exactly representable in binary, so the boundary comparisons are stable.
+@pytest.mark.parametrize('distance, ok', [(0.5, True), (0.5625, False), (0.25, True)])
+def test_dock_front_distance_min_max_inclusive(distance: float, ok: bool) -> None:
+    node = make_shelf_node('dry_run')
+    node.shelf_front_distance_min = 0.25
+    node.shelf_front_distance_max = 0.5
+    place_robot(node, pose(1.0 - distance, 0.0))
+    node._execute_command(dock())
+    assert (published_payloads(node) != rejected('cmd-dock', 'precheck_not_in_front')) is ok
+
+
+@pytest.mark.parametrize('offset, ok', [(0.5, True), (0.625, False)])
+def test_at_location_tolerance_boundary(offset: float, ok: bool) -> None:
+    node = make_shelf_node('dry_run', carrying='S1')
+    node.shelf_at_location_tolerance = 0.5
+    place_robot(node, pose(1.0 - offset, 0.0))
+    node._execute_command(undock())
+    assert (published_payloads(node) != rejected('cmd-undock', 'precheck_not_in_front')) is ok
+
+
+@pytest.mark.parametrize('shelf_x, expected', [(1.5, 'S1'), (1.625, None)])
+def test_match_radius_boundary(shelf_x: float, expected: object) -> None:
+    node = make_shelf_node('dry_run')
+    node.shelf_match_radius = 0.5
+    node.kachaka_client.stub.GetShelves = MagicMock(return_value=SimpleNamespace(
+        shelves=[SimpleNamespace(id='S1', pose=pose(shelf_x, 0.0))]))
+    assert node._shelf_at_location(LOCATIONS[0]) == expected
+
+
+def test_nearest_shelf_within_radius_is_chosen() -> None:
+    node = make_shelf_node('dry_run')
+    node.shelf_match_radius = 0.5
+    shelves = [
+        SimpleNamespace(id='FAR', pose=pose(1.25, 0.0)),
+        SimpleNamespace(id='NEAR', pose=pose(1.0, 0.125)),
+        SimpleNamespace(id='MID', pose=pose(1.0, -0.25)),
+    ]
+    node.kachaka_client.stub.GetShelves = MagicMock(return_value=SimpleNamespace(shelves=shelves))
+    assert node._shelf_at_location(LOCATIONS[0]) == 'NEAR'
+
+
+def test_dry_run_undock_clears_carried_shelf_memory() -> None:
+    node = make_shelf_node('dry_run')
+    node._execute_command(dock())
+    asyncio.run(node.publish_result())
+    assert node._carried_shelf == ('loc-a1', 'S1')
+    place_robot(node, AT_A1)
+    node._execute_command(undock())
+    asyncio.run(node.publish_result())
+    assert published_payloads(node)[-1] == {'id': 'cmd-undock', 'is_completed': True, 'success': True}
+    assert node._carried_shelf is None

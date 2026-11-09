@@ -377,10 +377,7 @@ class KachakaApiClientByZenoh:
                               self.SHELF_DRIVERS)
         self.shelf_dry_run_duration = float(config.get('shelf_dry_run_duration', 0.0))
         self.shelf_dry_run_shelf_id = config.get('shelf_dry_run_shelf_id')
-        shelf_precheck = config.get('shelf_precheck', {})
-        for key in ('front_distance_min', 'front_distance_max', 'front_yaw_tolerance', 'front_yaw_offset',
-                    'at_location_tolerance', 'match_radius'):
-            setattr(self, f'shelf_{key}', float(shelf_precheck.get(key, getattr(self, f'shelf_{key}'))))
+        self._load_shelf_precheck_config(config.get('shelf_precheck', {}))
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
         self.command_max_retries = connection.get('command_max_retries', 2)
@@ -827,6 +824,27 @@ class KachakaApiClientByZenoh:
             return False, None
 
         return True, None
+
+    def _load_shelf_precheck_config(self, section: Optional[Dict[str, Any]]) -> None:
+        """Load and validate the shelf_precheck section (Issue #58); raise ValueError on a bad value."""
+        if not isinstance(section, dict):
+            raise ValueError(f'shelf_precheck must be a mapping, got {section!r}')
+        values = {}
+        for key in ('front_distance_min', 'front_distance_max', 'front_yaw_tolerance', 'front_yaw_offset',
+                    'at_location_tolerance', 'match_radius'):
+            raw = section.get(key, getattr(self, f'shelf_{key}'))
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f'shelf_precheck.{key} must be a number, got {raw!r}') from None
+            if not math.isfinite(value) or (value < 0 and key != 'front_yaw_offset'):
+                raise ValueError(f'shelf_precheck.{key} must be a finite non-negative number, got {raw!r}')
+            values[key] = value
+        if values['front_distance_min'] > values['front_distance_max']:
+            raise ValueError(f'shelf_precheck.front_distance_min ({values["front_distance_min"]}) must not exceed '
+                             f'front_distance_max ({values["front_distance_max"]})')
+        for key, value in values.items():
+            setattr(self, f'shelf_{key}', value)
 
     def _load_undock_config(self, undock: Dict[str, Any]) -> None:
         """Load the undock prefix settings (Issue #51).

@@ -212,6 +212,8 @@ shelf_precheck:
 # shelf_dry_run_shelf_id: S2  # dry_run only: shelf a simulated dock picks up (reproduces physical_shelf_mismatch)
 ```
 
+`front_yaw_offset` is a single global value and does not follow the `forward` argument of `shelf_dock`; mixing forward and backward approaches makes one of them fail with `precheck_not_in_front`.
+
 | Case | Result |
 |---|---|
 | `shelf_dock`, empty, not in front of the location | `precheck_not_in_front` |

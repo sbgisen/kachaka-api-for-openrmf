@@ -344,7 +344,46 @@ def test_dry_run_cancel_of_other_command_calls_robot() -> None:
     node = make_shelf_node('dry_run')
     node._execute_command({'id': 'cmd-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 2.0, 'yaw': 0.0}})
     node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
-    node.kachaka_client.cancel_command.assert_called_once()
+    node.kachaka_client.cancel_command.assert_called_once_with()
+
+
+def test_dry_run_cancel_after_simulated_shelf_command_finished_calls_robot() -> None:
+    """Once the simulated shelf command has finished, a cancel goes to the robot."""
+    node = make_shelf_node('dry_run')
+    node._execute_command(dock())
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': True, 'success': True}]
+    node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
+    node.kachaka_client.cancel_command.assert_called_once_with()
+
+
+def test_dry_run_move_superseding_simulated_shelf_command_reaches_robot() -> None:
+    """A move that replaces a simulated shelf command is sent to the robot, and so is its cancel."""
+    node = make_shelf_node('dry_run')
+    node.shelf_dry_run_duration = 60.0
+    node.kachaka_client.move_to_pose = MagicMock()
+    node._execute_command(dock())
+    node._execute_command({'id': 'cmd-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 2.0, 'yaw': 0.0}})
+    node.kachaka_client.stub.StartCommand.assert_called_once()
+    assert sent_command(node).WhichOneof('command') == 'move_to_pose_command'
+    node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
+    node.kachaka_client.cancel_command.assert_called_once_with()
+
+
+def test_command_completion_timeout_defaults_to_180_without_config(tmp_path: Path) -> None:
+    """The bridge watchdog (180 s) must stay shorter than the adapter's completion wait (240 s)."""
+    config_file = tmp_path / 'config.yaml'
+    config_file.write_text(yaml.safe_dump({}))
+    with patch.object(connect_openrmf_by_zenoh, 'zenoh'), \
+            patch.object(connect_openrmf_by_zenoh, 'KachakaApiClientWithKeepalive'):
+        node = KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447', config_file=str(config_file))
+    assert node.command_completion_timeout == 180.0
+
+
+def test_config_yaml_command_completion_is_180() -> None:
+    config_file = Path(__file__).resolve().parents[1] / 'config' / 'config.yaml'
+    config = yaml.safe_load(config_file.read_text())
+    assert config['timeouts']['command_completion'] == 180.0
 
 
 def test_dry_run_timeout_is_reported_by_watchdog() -> None:

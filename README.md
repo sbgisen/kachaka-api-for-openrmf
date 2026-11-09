@@ -144,6 +144,7 @@ map_name_mapping:
 timeouts:
   command_query: 2.0        # Command query timeout in seconds
   grpc_connection: 5        # gRPC connection retry interval
+  command_completion: 180.0 # Watchdog: fail a command with no RUNNING/completion for this long
 
 intervals:
   command_check: 4.0        # Command polling interval in seconds
@@ -153,6 +154,8 @@ connection:
   max_retries: 20           # Maximum gRPC connection retries
   max_consecutive_errors: 10 # Error threshold before exit
 ```
+
+`timeouts.command_completion` defaults to 180.0 s. Keep it shorter than the adapter's completion wait (240 s by default), so the bridge's watchdog fails the command before the adapter gives up on it.
 
 **Shelf Driver** - Selects how `shelf_dock` / `shelf_undock` are executed. There is no default; while it is unset, shelf commands fail with `reason=precheck_no_shelf_driver`:
 ```yaml
@@ -170,7 +173,7 @@ Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, d
 
 `dry_run` simulates only the shelf API. Movement and other commands still reach the robot. A `cancel_command` is simulated (the robot's `cancel_command` is not called) only while a simulated shelf command is in progress; any other cancel is sent to the robot as usual.
 
-Reasons a shelf command can fail with. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
+Reasons a command can fail with, from this bridge (shelf commands and `move_to_pose`) and from the adapter. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
 
 | reason | Raised when |
 |---|---|
@@ -188,6 +191,12 @@ Reasons a shelf command can fail with. They are labels for diagnosis: robot_cont
 | `start_timeout` | no RUNNING within `timeouts.command_start` |
 | `progress_timeout` | no pose change within `timeouts.motion_progress` while RUNNING |
 | `missing_command_id` | `StartCommand` returned no command id |
+| `map_mismatch` | `move_to_pose` only: the robot is not on the requested map, or the map could not be read |
+| `undock_endpoint_rejected` | `move_to_pose` only: the undock endpoint is too close to another charger or too far from every lane |
+| `undock_failed` | `move_to_pose` only: Kachaka reported the undock move as failed |
+| `undock_start_timeout` | `move_to_pose` only: no RUNNING of the undock move within `undock.timeouts.start` |
+| `undock_progress_timeout` | `move_to_pose` only: no pose change of the undock move within `undock.timeouts.progress` |
+| `undock_phase_timeout` | `move_to_pose` only: the undock phase exceeded `undock.timeouts.phase_total` |
 | `physical_state_unknown` | set by the adapter, not this bridge: a failure that came without a `reason` |
 | `adapter_completion_timeout` | set by the adapter, not this bridge: no completion within the adapter's wait limit |
 

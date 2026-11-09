@@ -319,6 +319,34 @@ def test_dry_run_cancel_by_new_command_completes_shelf_task() -> None:
     assert node._dry_run_carrying is False
 
 
+def test_dry_run_cancel_of_simulated_shelf_command_does_not_call_robot() -> None:
+    node = make_shelf_node('dry_run')
+    node.shelf_dry_run_duration = 60.0
+    node._execute_command(dock())
+    node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
+    node.kachaka_client.cancel_command.assert_not_called()
+    assert published_payloads(node) == [
+        {
+            'id': 'cmd-dock',
+            'is_completed': True,
+            'success': False
+        },
+        {
+            'id': 'cmd-cancel',
+            'is_completed': True,
+            'success': True
+        },
+    ]
+    assert node._dry_run_carrying is False
+
+
+def test_dry_run_cancel_of_other_command_calls_robot() -> None:
+    node = make_shelf_node('dry_run')
+    node._execute_command({'id': 'cmd-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 2.0, 'yaw': 0.0}})
+    node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
+    node.kachaka_client.cancel_command.assert_called_once()
+
+
 def test_dry_run_timeout_is_reported_by_watchdog() -> None:
     node = make_shelf_node('dry_run')
     node.shelf_dry_run_duration = 600.0

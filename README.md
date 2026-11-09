@@ -168,6 +168,29 @@ shelf_dry_run_duration: 0.0   # dry_run only: seconds before the simulated comma
 
 Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, default false)}`, `shelf_undock` takes `{"location": str}`. `location` is matched against the id or name of `get_locations()`. Failures carry a `reason`: `precheck_*` means no shelf API was called, `physical_*` means it failed after the API was issued. A failure with no `reason` (from existing paths such as a rejected `StartCommand`, supersede, or the watchdog) is treated by the adapter as physical state unknown.
 
+`dry_run` simulates only the shelf API. Movement and other commands still reach the robot. A `cancel_command` is simulated (the robot's `cancel_command` is not called) only while a simulated shelf command is in progress; any other cancel is sent to the robot as usual.
+
+Reasons a shelf command can fail with. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
+
+| reason | Raised when |
+|---|---|
+| `precheck_no_shelf_driver` | `shelf_driver` is not set |
+| `precheck_invalid_shelf_driver` | `shelf_driver` is not `pro` / `standard` / `dry_run` |
+| `precheck_invalid_args` | `location` is not a non-empty string, or `forward` is not a bool |
+| `precheck_location_unavailable` | `get_locations()` failed |
+| `precheck_unknown_location` | `location` matches no Kachaka location |
+| `physical_command_failed` | Kachaka reported the shelf command as failed |
+| `physical_shelf_not_docked` | dock reported success but `get_moving_shelf_id()` is empty |
+| `physical_shelf_still_docked` | undock reported success but `get_moving_shelf_id()` is not empty |
+| `physical_shelf_state_unknown` | `get_moving_shelf_id()` failed after the command finished |
+| `external_busy` | rejected while a command started outside this bridge is running |
+| `external_preempted` | preempted by a `returnHome` started outside this bridge |
+| `start_timeout` | no RUNNING within `timeouts.command_start` |
+| `progress_timeout` | no pose change within `timeouts.motion_progress` while RUNNING |
+| `missing_command_id` | `StartCommand` returned no command id |
+| `physical_state_unknown` | set by the adapter, not this bridge: a failure that came without a `reason` |
+| `adapter_completion_timeout` | set by the adapter, not this bridge: no completion within the adapter's wait limit |
+
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 
 #### Connecting to an mTLS router

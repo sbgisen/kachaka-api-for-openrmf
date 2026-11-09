@@ -1953,9 +1953,13 @@ class KachakaApiClientByZenoh:
                         self.last_progress_at = time.monotonic()
                         return
 
-                    self._complete_superseded_task(new_task_id)
                     method_name = command['method']
                     method_name = self.method_mapping.get(method_name, method_name)
+                    # A cancel of a dry_run shelf command is simulated too: the
+                    # shelf command never reached the robot, so the real
+                    # cancel_command would stop an unrelated robot action.
+                    simulate_cancel = method_name == 'cancel_command' and self._dry_run_shelf is not None
+                    self._complete_superseded_task(new_task_id)
                     self.task_id = new_task_id
 
                     if method_name not in self.SHELF_METHODS and not hasattr(self.kachaka_client, method_name):
@@ -2003,7 +2007,11 @@ class KachakaApiClientByZenoh:
 
                 try:
                     # Heavy gRPC work: outside _command_lock, guarded by dispatching.
-                    if method_name == 'switch_map':
+                    if simulate_cancel:
+                        self._log_info(f'dry_run: cancel {new_task_id} of the simulated shelf command; '
+                                       'not calling cancel_command on the robot')
+                        self._publish_command_completion(success=True, error_code=0, task_id=new_task_id)
+                    elif method_name == 'switch_map':
                         self._execute_switch_map_sync(command['args'], new_task_id)
                     elif method_name == 'move_to_pose':
                         args = command['args'].copy()

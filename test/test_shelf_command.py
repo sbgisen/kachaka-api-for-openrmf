@@ -341,8 +341,12 @@ def test_dry_run_cancel_of_simulated_shelf_command_does_not_call_robot() -> None
 
 
 def test_dry_run_cancel_of_other_command_calls_robot() -> None:
+    """A move started on the robot is cancelled on the robot even during dry_run."""
     node = make_shelf_node('dry_run')
+    node.kachaka_client.move_to_pose = MagicMock()
     node._execute_command({'id': 'cmd-move', 'method': 'move_to_pose', 'args': {'x': 1.0, 'y': 2.0, 'yaw': 0.0}})
+    node.kachaka_client.stub.StartCommand.assert_called_once()
+    assert sent_command(node).WhichOneof('command') == 'move_to_pose_command'
     node._execute_command({'id': 'cmd-cancel', 'method': 'cancel_command', 'args': {}})
     node.kachaka_client.cancel_command.assert_called_once_with()
 

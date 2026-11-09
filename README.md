@@ -166,7 +166,7 @@ shelf_dry_run_duration: 0.0   # dry_run only: seconds before the simulated comma
 | `standard` | `dock_shelf()` | `undock_shelf()` |
 | `dry_run` | no API call, simulated carrying = true | no API call, simulated carrying = false |
 
-Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, default false)}`, `shelf_undock` takes `{"location": str}`. `location` is matched against the id or name of `get_locations()`. Failures carry a `reason`: `precheck_*` means no shelf API was called, `physical_*` means it failed after the API was issued.
+Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, default false)}`, `shelf_undock` takes `{"location": str}`. `location` is matched against the id or name of `get_locations()`. Failures carry a `reason`: `precheck_*` means no shelf API was called, `physical_*` means it failed after the API was issued. A failure with no `reason` (from existing paths such as a rejected `StartCommand`, supersede, or the watchdog) is treated by the adapter as physical state unknown.
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 

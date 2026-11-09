@@ -26,12 +26,17 @@ import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
+from connect_openrmf_by_zenoh import KachakaApiClientByZenoh  # noqa: E402
+import connect_openrmf_by_zenoh  # noqa: E402
+from test_command_lifecycle import FakeRpcError  # noqa: E402
 from test_command_lifecycle import make_node  # noqa: E402
 from test_command_lifecycle import published_payloads  # noqa: E402
 from test_command_lifecycle import stub_start_command_response  # noqa: E402
@@ -192,6 +197,72 @@ def test_kachaka_failure_is_physical_and_not_retried() -> None:
         'reason': 'physical_command_failed'
     }]
     assert node.kachaka_client.stub.StartCommand.call_count == 1
+
+
+def test_positive_error_code_failure_is_not_retried() -> None:
+    """A positive error_code is retriable for ordinary commands; precheck_/physical_ must still stop (N1)."""
+    node = make_shelf_node('standard')
+    node.retry_enabled = True
+    node.max_navigation_retries = 3
+    node.retry_on_error_types = ['Error']
+    node._execute_command(dock())
+    finish_on_robot(node, 'dockShelfCommand', success=False, error_code=5)
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == [{
+        'id': 'cmd-dock',
+        'is_completed': True,
+        'success': False,
+        'reason': 'physical_command_failed'
+    }]
+    assert node.kachaka_client.stub.StartCommand.call_count == 1
+
+
+@pytest.mark.parametrize('method, command_field', [('shelf_dock', 'dockShelfCommand'),
+                                                   ('shelf_undock', 'undockShelfCommand')])
+def test_get_moving_shelf_id_rpc_error_is_physical_state_unknown(method: str, command_field: str) -> None:
+    """If the post-completion shelf check cannot run, the result is a failure (N2)."""
+    node = make_shelf_node('standard')
+    node.kachaka_client.stub.GetMovingShelfId = MagicMock(side_effect=FakeRpcError())
+    node._execute_command(dock() if method == 'shelf_dock' else undock())
+    finish_on_robot(node, command_field)
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == [{
+        'id': 'cmd-dock' if method == 'shelf_dock' else 'cmd-undock',
+        'is_completed': True,
+        'success': False,
+        'reason': 'physical_shelf_state_unknown'
+    }]
+
+
+@pytest.mark.parametrize('config, expected', [({}, None), ({'shelf_driver': 'pro'}, 'pro')])
+def test_shelf_driver_comes_from_config_without_default(tmp_path: Path, config: dict, expected: object) -> None:
+    """Load shelf_driver through __init__'s config path; an absent key gets no default (N3)."""
+    config_file = tmp_path / 'config.yaml'
+    config_file.write_text(yaml.safe_dump(config))
+    with patch.object(connect_openrmf_by_zenoh, 'zenoh'), \
+            patch.object(connect_openrmf_by_zenoh, 'KachakaApiClientWithKeepalive'):
+        node = KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447', config_file=str(config_file))
+    assert node.shelf_driver == expected
+    if expected is None:
+        shelf_node = make_shelf_node(node.shelf_driver)
+        shelf_node._execute_command(dock())
+        assert published_payloads(shelf_node)[-1]['reason'] == 'precheck_no_shelf_driver'
+
+
+def test_shelf_dispatch_reconciles_pending_snapshot_like_other_async_commands() -> None:
+    """A RUNNING id seen during a shelf dispatch is reconciled, not discarded as for sync methods (N4)."""
+    node = make_shelf_node('standard')
+    node.external_control_active = False
+    node._external_command_id = None
+    node._handle_external_command_started = MagicMock()
+
+    def start_command(*_args: object, **_kwargs: object) -> object:
+        node._pending_dispatch_snapshot_id = 'ext-during-dispatch'
+        return stub_start_command_response(command_id='grpc-s')
+
+    node.kachaka_client.stub.StartCommand = MagicMock(side_effect=start_command)
+    node._execute_command(dock())
+    node._handle_external_command_started.assert_called_once_with('ext-during-dispatch')
 
 
 def test_own_shelf_command_is_not_treated_as_external() -> None:

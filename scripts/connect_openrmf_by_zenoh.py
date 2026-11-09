@@ -328,6 +328,8 @@ class KachakaApiClientByZenoh:
         self.grpc_telemetry_timeout = timeouts.get('grpc_telemetry', 5.0)
         self.grpc_status_check_timeout = timeouts.get('grpc_status_check', 5.0)
         self.grpc_stuck_threshold = float(timeouts.get('grpc_stuck', 30.0))
+        # Keep this shorter than the shelf action completion limit of fleet_adapter_zenoh
+        # (shelf_action.completion_timeout_sec, default 240 s). If set to 240 or more, change the adapter too.
         self.command_completion_timeout = float(timeouts.get('command_completion', 180.0))
         self.command_start_timeout = float(timeouts.get('command_start', 15.0))
         self.motion_progress_timeout = float(timeouts.get('motion_progress', 30.0))

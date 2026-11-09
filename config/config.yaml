@@ -18,6 +18,9 @@ timeouts:
   grpc_telemetry: 5.0       # Timeout for telemetry gRPC calls (get_robot_pose, etc.)
   grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
   grpc_stuck: 30.0          # Threshold (sec) for treating persistent Deadline Exceeded as a stuck channel
+  # Keep command_completion shorter than the shelf action completion limit of fleet_adapter_zenoh
+  # (shelf_action.completion_timeout_sec, default 240 s). If you set it to 240 or more,
+  # change the adapter side as well.
   command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
   command_start: 15.0       # Max wait for RUNNING after an async command (move_to_pose/return_home) is dispatched
   motion_progress: 30.0     # Max time with no position/yaw change while RUNNING before treated as stuck

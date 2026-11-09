@@ -2236,6 +2236,28 @@ class KachakaApiClientByZenoh:
                 self.logger.info('Nothing to do - already on target map')
                 self._publish_command_completion(success=True, error_code=0, task_id=task_id)
             else:
+                # A shelf survives a floor change only with Pro's inherit flag;
+                # without shelf_driver keep the pre-#59 behavior (Issue #59).
+                if self.shelf_driver is not None:
+                    try:
+                        carrying = self._moving_shelf_id()
+                    except RpcError as e:
+                        self._log_error('RPC', 'switch_map shelf check', e)
+                        self._publish_command_completion(success=False,
+                                                         error_code=-1,
+                                                         task_id=task_id,
+                                                         reason='precheck_state_unavailable')
+                        return
+                    if carrying and self.shelf_driver == 'pro':
+                        payload['inherit_docking_state_and_docked_shelf'] = True
+                    elif carrying:
+                        self._log_error_msg(
+                            f'Refusing switch_map while carrying shelf {carrying} (shelf_driver={self.shelf_driver})')
+                        self._publish_command_completion(success=False,
+                                                         error_code=-1,
+                                                         task_id=task_id,
+                                                         reason='carrying_on_standard')
+                        return
                 # Suppress automatic completion in _execute_sync_method so we can
                 # publish map_name to Zenoh *before* notifying RMF of completion.
                 # This prevents a race where RMF receives the completion, queries

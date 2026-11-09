@@ -743,3 +743,77 @@ def test_rerun_undock_without_memory_accepts_any_shelf_at_location() -> None:
         shelves=[SimpleNamespace(id='S2', pose=pose(1.0, 0.0))])
     node._execute_command(undock())
     assert published_payloads(node) == [{'id': 'cmd-undock', 'is_completed': True, 'success': True}]
+
+
+# ---------------------------------------------------------------------------
+# switch_map while carrying a shelf (Issue #59)
+# ---------------------------------------------------------------------------
+
+SWITCH_MAP = {'map_name': '10F', 'pose': {'x': 1.0, 'y': 2.0, 'theta': 0.5}}
+
+
+def make_switch_map_node(driver: object, carrying: str) -> object:
+    """Shelf node on map 8F whose switch_map to 10F succeeds."""
+    node = make_shelf_node(driver, carrying)
+    node.kachaka_client.get_map_list = MagicMock(return_value=[{
+        'id': 'm8',
+        'name': '8F'
+    }, {
+        'id': 'm10',
+        'name': '10F'
+    }])
+    node.kachaka_client.get_current_map_id = MagicMock(return_value='m8')
+    node.kachaka_client.switch_map = MagicMock(return_value={'success': True})
+    return node
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_switch_map_while_carrying_is_rejected_without_standard_inherit(driver: str) -> None:
+    node = make_switch_map_node(driver, carrying='S1')
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    assert published_payloads(node) == rejected('cmd-map', 'carrying_on_standard')
+    node.kachaka_client.switch_map.assert_not_called()
+    node.map_name_pub.assert_not_called()
+
+
+@pytest.mark.parametrize('driver', [None, 'pro', 'standard', 'dry_run'])
+def test_switch_map_when_empty_switches_without_inherit(driver: object) -> None:
+    node = make_switch_map_node(driver, carrying='')
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    node.kachaka_client.switch_map.assert_called_once_with(map_id='m10', pose=SWITCH_MAP['pose'])
+    assert published_payloads(node) == [{'id': 'cmd-map', 'is_completed': True, 'success': True}]
+
+
+def test_switch_map_without_shelf_driver_ignores_carrying_state() -> None:
+    node = make_switch_map_node(None, carrying='S1')
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    node.kachaka_client.switch_map.assert_called_once_with(map_id='m10', pose=SWITCH_MAP['pose'])
+    node.kachaka_client.stub.GetMovingShelfId.assert_not_called()
+
+
+def test_pro_switch_map_while_carrying_inherits_and_completes_after_map_and_pose() -> None:
+    node = make_switch_map_node('pro', carrying='S1')
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    node.kachaka_client.switch_map.assert_called_once_with(map_id='m10',
+                                                           pose=SWITCH_MAP['pose'],
+                                                           inherit_docking_state_and_docked_shelf=True)
+    order = [c.args[0] for c in node._publish_to_zenoh.call_args_list]
+    assert order == [node.map_name_pub, node.pose_pub, node.command_is_completed_pub]
+    assert published_payloads(node) == [{'id': 'cmd-map', 'is_completed': True, 'success': True}]
+
+
+def test_switch_map_shelf_state_rpc_error_is_rejected() -> None:
+    node = make_switch_map_node('pro', carrying='S1')
+    node.kachaka_client.stub.GetMovingShelfId = MagicMock(side_effect=FakeRpcError())
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    assert published_payloads(node) == rejected('cmd-map', 'precheck_state_unavailable')
+    node.kachaka_client.switch_map.assert_not_called()
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_switch_map_to_current_map_while_carrying_still_succeeds(driver: str) -> None:
+    node = make_switch_map_node(driver, carrying='S1')
+    node.kachaka_client.get_current_map_id = MagicMock(return_value='m10')
+    node._execute_switch_map_sync(SWITCH_MAP, 'cmd-map')
+    node.kachaka_client.switch_map.assert_not_called()
+    assert published_payloads(node) == [{'id': 'cmd-map', 'is_completed': True, 'success': True}]

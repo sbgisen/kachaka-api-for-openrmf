@@ -200,6 +200,31 @@ Reasons a command can fail with, from this bridge (shelf commands and `move_to_p
 | `physical_state_unknown` | set by the adapter, not this bridge: a failure that came without a `reason` |
 | `adapter_completion_timeout` | set by the adapter, not this bridge: no completion within the adapter's wait limit |
 
+**Shelf Precheck** - Before calling a shelf API the bridge checks the robot position and the carrying state (Issue #58). The tolerances are shared by all drivers and are placeholders until measured:
+```yaml
+shelf_precheck:
+  front_distance_min: 0.3     # m, shelf_dock: robot-to-location distance range
+  front_distance_max: 1.2
+  front_yaw_tolerance: 0.35   # rad, shelf_dock: |bearing to the location - (robot yaw + offset)|
+  front_yaw_offset: 0.0       # rad, set pi if the robot backs into the shelf
+  at_location_tolerance: 0.3  # m, robot-to-location distance while carrying
+  match_radius: 0.3           # m, a get_shelves() shelf this close is at the location
+# shelf_dry_run_shelf_id: S2  # dry_run only: shelf a simulated dock picks up (reproduces physical_shelf_mismatch)
+```
+
+| Case | Result |
+|---|---|
+| `shelf_dock`, empty, not in front of the location | `precheck_not_in_front` |
+| `shelf_dock`, carrying the shelf this bridge docked at the location (or any shelf after a restart) and at the location | `success: true`, no API call |
+| `shelf_dock`, carrying any other shelf | `precheck_already_carrying_other` |
+| `shelf_dock` finished with another shelf than `get_shelves()` showed at the location | `physical_shelf_mismatch` |
+| `shelf_undock`, carrying, not at the location | `precheck_not_in_front` |
+| `shelf_undock`, empty, a shelf at the location | `success: true`, no API call |
+| `shelf_undock`, empty, no shelf at the location | `precheck_unknown` |
+| robot pose / shelf state could not be read | `precheck_state_unavailable` |
+
+In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised).
+
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 
 #### Connecting to an mTLS router

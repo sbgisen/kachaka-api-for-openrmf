@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Regression tests for shelf_dock / shelf_undock and shelf_driver (Issue #57).
+"""Regression tests for shelf_dock / shelf_undock, shelf_driver and the shelf prechecks (Issue #57, #58).
 
 Runs without a Kachaka robot or a Zenoh router: the gRPC client and the
 Zenoh publishers are mocked, the same way as test_command_lifecycle.py.
@@ -21,6 +21,7 @@ Zenoh publishers are mocked, the same way as test_command_lifecycle.py.
 # ruff: noqa: SLF001
 
 import asyncio
+import math
 from pathlib import Path
 import sys
 import time
@@ -41,18 +42,44 @@ from test_command_lifecycle import make_node  # noqa: E402
 from test_command_lifecycle import published_payloads  # noqa: E402
 from test_command_lifecycle import stub_start_command_response  # noqa: E402
 
-LOCATIONS = [SimpleNamespace(id='loc-a1', name='a1'), SimpleNamespace(id='loc-a2', name='a2')]
+
+def pose(x: float, y: float, theta: float = 0.0) -> SimpleNamespace:
+    return SimpleNamespace(x=x, y=y, theta=theta)
 
 
-def make_shelf_node(driver: object) -> object:
-    """Build a node with the given shelf_driver and a mocked locations/shelf stub."""
+# a1 / a2 side by side (0.95m apart); the robot faces +x.
+LOCATIONS = [
+    SimpleNamespace(id='loc-a1', name='a1', pose=pose(1.0, 0.0)),
+    SimpleNamespace(id='loc-a2', name='a2', pose=pose(1.0, 0.95)),
+]
+SHELVES = [SimpleNamespace(id='S1', pose=pose(1.0, 0.0)), SimpleNamespace(id='S2', pose=pose(1.0, 0.95))]
+IN_FRONT_OF_A1 = pose(0.5, 0.0)
+AT_A1 = pose(1.0, 0.0)
+
+
+def make_shelf_node(driver: object, carrying: str = '') -> object:
+    """Build a node with the given shelf_driver and a mocked locations/shelf stub.
+
+    The robot stands in front of a1 when empty and at a1 when carrying.
+    """
     node = make_node(client_methods=['stub', 'cancel_command'])
     node.shelf_driver = driver
     node.grpc_connection_check = MagicMock(return_value=True)
     node.kachaka_client.stub.GetLocations = MagicMock(return_value=SimpleNamespace(locations=LOCATIONS))
-    node.kachaka_client.stub.GetMovingShelfId = MagicMock(return_value=SimpleNamespace(shelf_id=''))
+    node.kachaka_client.stub.GetShelves = MagicMock(return_value=SimpleNamespace(shelves=SHELVES))
+    node.kachaka_client.stub.GetMovingShelfId = MagicMock(return_value=SimpleNamespace(shelf_id=carrying))
+    node._dry_run_moving_shelf_id = carrying
+    place_robot(node, AT_A1 if carrying else IN_FRONT_OF_A1)
     node.kachaka_client.stub.StartCommand = MagicMock(return_value=stub_start_command_response(command_id='grpc-s'))
     return node
+
+
+def place_robot(node: object, robot_pose: SimpleNamespace) -> None:
+    node.kachaka_client.stub.GetRobotPose = MagicMock(return_value=SimpleNamespace(pose=robot_pose))
+
+
+def rejected(task_id: str, reason: str) -> list:
+    return [{'id': task_id, 'is_completed': True, 'success': False, 'reason': reason}]
 
 
 def dock(task_id: str = 'cmd-dock', location: str = 'a1', forward: bool = True) -> dict:
@@ -147,7 +174,7 @@ def test_pro_dock_dispatches_dock_any_shelf_with_registration() -> None:
     ],
 )
 def test_driver_maps_to_expected_kachaka_command(driver: str, method: str, field: str) -> None:
-    node = make_shelf_node(driver)
+    node = make_shelf_node(driver, carrying='S1' if method == 'shelf_undock' else '')
     node._execute_command(dock() if method == 'shelf_dock' else undock())
     assert sent_command(node).WhichOneof('command') == field
 
@@ -175,7 +202,7 @@ def test_standard_dock_reported_success_without_shelf_is_physical_failure() -> N
 
 
 def test_standard_undock_success_requires_no_moving_shelf() -> None:
-    node = make_shelf_node('standard')
+    node = make_shelf_node('standard', carrying='S1')
     node._execute_command(undock())
     finish_on_robot(node, 'undockShelfCommand')
     node.kachaka_client.stub.GetMovingShelfId.return_value = SimpleNamespace(shelf_id='S1')
@@ -221,9 +248,9 @@ def test_positive_error_code_failure_is_not_retried() -> None:
                                                    ('shelf_undock', 'undockShelfCommand')])
 def test_get_moving_shelf_id_rpc_error_is_physical_state_unknown(method: str, command_field: str) -> None:
     """If the post-completion shelf check cannot run, the result is a failure (N2)."""
-    node = make_shelf_node('standard')
-    node.kachaka_client.stub.GetMovingShelfId = MagicMock(side_effect=FakeRpcError())
+    node = make_shelf_node('standard', carrying='S1' if method == 'shelf_undock' else '')
     node._execute_command(dock() if method == 'shelf_dock' else undock())
+    node.kachaka_client.stub.GetMovingShelfId = MagicMock(side_effect=FakeRpcError())
     finish_on_robot(node, command_field)
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{
@@ -291,14 +318,145 @@ def test_dry_run_dock_then_undock_succeed_without_shelf_api() -> None:
     assert published_payloads(node) == []
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': True, 'success': True}]
-    assert node._dry_run_carrying is True
+    assert node._dry_run_moving_shelf_id == 'S1'
 
+    place_robot(node, AT_A1)
     node._execute_command(undock())
     asyncio.run(node.publish_result())
     assert published_payloads(node)[-1] == {'id': 'cmd-undock', 'is_completed': True, 'success': True}
-    assert node._dry_run_carrying is False
+    assert node._dry_run_moving_shelf_id == ''
     node.kachaka_client.stub.StartCommand.assert_not_called()
     node.kachaka_client.stub.GetMovingShelfId.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #58: position / carrying-state prechecks and shelf-ID match
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+@pytest.mark.parametrize(
+    'robot_pose',
+    [pose(0.9, 0.0), pose(-1.0, 0.0), pose(0.5, 0.0, math.pi / 2),
+     pose(0.5, 0.5)],
+    ids=['too_close', 'too_far', 'facing_away', 'off_axis'],
+)
+def test_dock_not_in_front_is_rejected_without_api_call(driver: str, robot_pose: SimpleNamespace) -> None:
+    node = make_shelf_node(driver)
+    place_robot(node, robot_pose)
+    node._execute_command(dock())
+    assert published_payloads(node) == rejected('cmd-dock', 'precheck_not_in_front')
+    node.kachaka_client.stub.StartCommand.assert_not_called()
+
+
+def test_front_yaw_offset_allows_backing_in() -> None:
+    node = make_shelf_node('standard')
+    node.shelf_front_yaw_offset = math.pi
+    place_robot(node, pose(0.5, 0.0, math.pi))
+    node._execute_command(dock())
+    assert sent_command(node).WhichOneof('command') == 'dock_shelf_command'
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_undock_away_from_location_is_rejected(driver: str) -> None:
+    node = make_shelf_node(driver, carrying='S1')
+    place_robot(node, IN_FRONT_OF_A1)
+    node._execute_command(undock())
+    assert published_payloads(node) == rejected('cmd-undock', 'precheck_not_in_front')
+    node.kachaka_client.stub.StartCommand.assert_not_called()
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_dock_while_carrying_another_shelf_is_rejected(driver: str) -> None:
+    node = make_shelf_node(driver, carrying='S2')
+    node._carried_shelf = ('loc-a2', 'S2')
+    node._execute_command(dock())
+    assert published_payloads(node) == rejected('cmd-dock', 'precheck_already_carrying_other')
+    node.kachaka_client.stub.StartCommand.assert_not_called()
+
+
+def test_dock_while_carrying_away_from_location_is_rejected_after_restart() -> None:
+    node = make_shelf_node('dry_run', carrying='S1')
+    place_robot(node, IN_FRONT_OF_A1)
+    node._execute_command(dock())
+    assert published_payloads(node) == rejected('cmd-dock', 'precheck_already_carrying_other')
+
+
+def test_dry_run_rerun_of_finished_dock_succeeds_without_api() -> None:
+    node = make_shelf_node('dry_run')
+    node._execute_command(dock())
+    asyncio.run(node.publish_result())
+    place_robot(node, AT_A1)
+    node._execute_command(dock(task_id='cmd-dock-again'))
+    assert published_payloads(node)[-1] == {'id': 'cmd-dock-again', 'is_completed': True, 'success': True}
+    assert node._dry_run_shelf is None
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_rerun_of_finished_dock_after_restart_uses_position_only(driver: str) -> None:
+    node = make_shelf_node(driver, carrying='S1')
+    node._execute_command(dock())
+    assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': True, 'success': True}]
+    node.kachaka_client.stub.StartCommand.assert_not_called()
+
+
+@pytest.mark.parametrize('driver', ['standard', 'dry_run'])
+def test_rerun_of_finished_undock_succeeds_without_api(driver: str) -> None:
+    node = make_shelf_node(driver)
+    place_robot(node, AT_A1)
+    node._execute_command(undock())
+    assert published_payloads(node) == [{'id': 'cmd-undock', 'is_completed': True, 'success': True}]
+    node.kachaka_client.stub.StartCommand.assert_not_called()
+
+
+def test_undock_with_no_shelf_anywhere_is_unknown() -> None:
+    node = make_shelf_node('dry_run')
+    node.kachaka_client.stub.GetShelves.return_value = SimpleNamespace(shelves=SHELVES[1:])
+    node._execute_command(undock())
+    assert published_payloads(node) == rejected('cmd-undock', 'precheck_unknown')
+
+
+def test_dry_run_mismatched_shelf_is_physical_and_blocks_redock() -> None:
+    node = make_shelf_node('dry_run')
+    node.shelf_dry_run_shelf_id = 'S2'
+    node._execute_command(dock())
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == rejected('cmd-dock', 'physical_shelf_mismatch')
+    assert node._dry_run_moving_shelf_id == 'S2'
+
+    place_robot(node, AT_A1)
+    node._execute_command(dock(task_id='cmd-dock-again'))
+    assert published_payloads(node)[-1] == rejected('cmd-dock-again', 'precheck_already_carrying_other')[0]
+
+
+def test_standard_dock_of_wrong_shelf_is_mismatch() -> None:
+    node = make_shelf_node('standard')
+    node._execute_command(dock())
+    finish_on_robot(node, 'dockShelfCommand')
+    node.kachaka_client.stub.GetMovingShelfId.return_value = SimpleNamespace(shelf_id='S2')
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == rejected('cmd-dock', 'physical_shelf_mismatch')
+    assert node._carried_shelf == (None, 'S2')
+
+
+def test_unregistered_shelf_dock_relies_on_front_check() -> None:
+    node = make_shelf_node('standard')
+    node.kachaka_client.stub.GetShelves.return_value = SimpleNamespace(shelves=SHELVES[1:])
+    node._execute_command(dock())
+    finish_on_robot(node, 'dockShelfCommand')
+    node.kachaka_client.stub.GetMovingShelfId.return_value = SimpleNamespace(shelf_id='S9')
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': True, 'success': True}]
+    assert node._carried_shelf == ('loc-a1', 'S9')
+
+
+@pytest.mark.parametrize('stub_method', ['GetMovingShelfId', 'GetShelves', 'GetRobotPose'])
+def test_unreadable_state_is_rejected(stub_method: str) -> None:
+    node = make_shelf_node('standard')
+    getattr(node.kachaka_client.stub, stub_method).side_effect = FakeRpcError()
+    node._execute_command(dock())
+    assert published_payloads(node) == rejected('cmd-dock', 'precheck_state_unavailable')
+    node.kachaka_client.stub.StartCommand.assert_not_called()
 
 
 def test_dry_run_reports_in_progress_until_duration_elapses() -> None:
@@ -307,7 +465,7 @@ def test_dry_run_reports_in_progress_until_duration_elapses() -> None:
     node._execute_command(dock())
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': False}]
-    assert node._dry_run_carrying is False
+    assert node._dry_run_moving_shelf_id == ''
 
 
 def test_dry_run_cancel_by_new_command_completes_shelf_task() -> None:
@@ -316,7 +474,7 @@ def test_dry_run_cancel_by_new_command_completes_shelf_task() -> None:
     node._execute_command(dock())
     node._execute_command(undock(task_id='cmd-next'))
     assert published_payloads(node)[0] == {'id': 'cmd-dock', 'is_completed': True, 'success': False}
-    assert node._dry_run_carrying is False
+    assert node._dry_run_moving_shelf_id == ''
 
 
 def test_dry_run_cancel_of_simulated_shelf_command_does_not_call_robot() -> None:
@@ -337,7 +495,7 @@ def test_dry_run_cancel_of_simulated_shelf_command_does_not_call_robot() -> None
             'success': True
         },
     ]
-    assert node._dry_run_carrying is False
+    assert node._dry_run_moving_shelf_id == ''
 
 
 def test_dry_run_cancel_of_other_command_calls_robot() -> None:
@@ -398,7 +556,7 @@ def test_dry_run_timeout_is_reported_by_watchdog() -> None:
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{'id': 'cmd-dock', 'is_completed': True, 'success': False}]
     assert node.task_id is None
-    assert node._dry_run_carrying is False
+    assert node._dry_run_moving_shelf_id == ''
 
 
 def test_dry_run_reissue_adopts_new_id_and_still_completes() -> None:
@@ -409,4 +567,4 @@ def test_dry_run_reissue_adopts_new_id_and_still_completes() -> None:
     node._dry_run_shelf = (node._dry_run_shelf[0], 0.0)
     asyncio.run(node.publish_result())
     assert published_payloads(node) == [{'id': 'cmd-dock-2', 'is_completed': True, 'success': True}]
-    assert node._dry_run_carrying is True
+    assert node._dry_run_moving_shelf_id == 'S1'

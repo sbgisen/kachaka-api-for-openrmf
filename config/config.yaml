@@ -73,6 +73,18 @@ navigation_retry:
 # shelf_driver: pro
 # dry_run only: seconds a shelf command stays in progress before it succeeds.
 shelf_dry_run_duration: 0.0
+# dry_run only: shelf ID a simulated dock picks up instead of the expected one (reproduces physical_shelf_mismatch).
+# shelf_dry_run_shelf_id: S2
+
+# Position tolerances checked before a shelf API call (Issue #58), shared by all drivers.
+# Placeholders until measured on a standard robot.
+shelf_precheck:
+  front_distance_min: 0.3     # m, shelf_dock: robot-to-location distance must be in [min, max]
+  front_distance_max: 1.2
+  front_yaw_tolerance: 0.35   # rad, shelf_dock: |bearing to the location - (robot yaw + offset)|
+  front_yaw_offset: 0.0       # rad, set pi if the robot backs into the shelf
+  at_location_tolerance: 0.3  # m, robot-to-location distance while carrying (undock, already docked)
+  match_radius: 0.3           # m, a get_shelves() shelf within this of the location is at the location
 
 # Optional: Custom Zenoh config file path.
 # Use this to enable mTLS against the Zenoh router; see

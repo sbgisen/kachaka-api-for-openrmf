@@ -230,6 +230,22 @@ class KachakaApiClientByZenoh:
     # Active two-phase undock command, or None when no undock is in flight.
     _undock: Optional[UndockPhase] = None
 
+    # Shelf dock/undock settings (Issue #57). No default driver on purpose:
+    # an unset shelf_driver rejects shelf_* with precheck_no_shelf_driver.
+    SHELF_DRIVERS = ('pro', 'standard', 'dry_run')
+    SHELF_METHODS = ('shelf_dock', 'shelf_undock')
+    shelf_driver: Optional[str] = None
+    shelf_dry_run_duration = 0.0
+    # 'shelf_dock' / 'shelf_undock' while one is active (pro/standard), for
+    # the get_moving_shelf_id() check at completion.
+    _shelf_method: Optional[str] = None
+    # (method, finish_at) of the active dry_run shelf command. Not keyed by
+    # task_id, so a re-issue adopting a new ID (_execute_command) keeps it.
+    # Cleared on every new dispatch and on completion.
+    _dry_run_shelf: Optional[tuple] = None
+    # Simulated carrying state of dry_run (no shelf API is called).
+    _dry_run_carrying = False
+
     # Allowed range for undock.distance_m: 1.0m would overshoot the 0.95m
     # spacing between two adjacent docks, and anything at or below
     # noop_distance_tolerance would "succeed" without the robot moving
@@ -248,6 +264,9 @@ class KachakaApiClientByZenoh:
     COMMAND_TYPE_FIELD = {
         'move_to_pose': 'moveToPoseCommand',
         'return_home': 'returnHomeCommand',
+        'dock_shelf': 'dockShelfCommand',
+        'undock_shelf': 'undockShelfCommand',
+        'dock_any_shelf_with_registration': 'dockAnyShelfWithRegistrationCommand',
     }
 
     # Kachaka command types known to occupy the robot's movement/command
@@ -324,6 +343,11 @@ class KachakaApiClientByZenoh:
         self.command_match_distance_tolerance = float(navigation.get('command_match_distance_tolerance', 0.75))
         self.command_match_yaw_tolerance = float(navigation.get('command_match_yaw_tolerance', 0.35))
         self._load_undock_config(config.get('undock', {}))
+        self.shelf_driver = config.get('shelf_driver')
+        if self.shelf_driver is not None and self.shelf_driver not in self.SHELF_DRIVERS:
+            self.logger.error('shelf_driver %r is not one of %s; shelf_* commands will be rejected', self.shelf_driver,
+                              self.SHELF_DRIVERS)
+        self.shelf_dry_run_duration = float(config.get('shelf_dry_run_duration', 0.0))
         self.main_loop_sleep = intervals.get('main_loop', 1)
         self.max_retries = connection.get('max_retries', 20)
         self.command_max_retries = connection.get('command_max_retries', 2)
@@ -1424,6 +1448,10 @@ class KachakaApiClientByZenoh:
                     self._publish_command_completion(success=False, error_code=-5)
                     return
 
+                if self._dry_run_shelf is not None:
+                    self._advance_dry_run_shelf()
+                    return
+
                 if self._undock_phase_timeout_expired():
                     self._log_error_msg(f'Undock phase for task {self.task_id} exceeded '
                                         f'{self.undock_phase_timeout}s; failing the task')
@@ -1545,6 +1573,10 @@ class KachakaApiClientByZenoh:
                             success = False
                             error_code = -2 if mismatch_reason == 'map_mismatch' else -1
                             reason = mismatch_reason
+                    if self._shelf_method is not None:
+                        success, reason = self._shelf_physical_check(success, reason)
+                        if not success:
+                            error_code = error_code or -1
                     if not success and reason is None and self._is_undock_phase1_active():
                         # Marks the failure as belonging to the departure move
                         # so it is never re-run by the navigation retry
@@ -1662,6 +1694,11 @@ class KachakaApiClientByZenoh:
             # times against the same obstacle. The undock prefix is decided
             # freshly on the next RMF command instead (Issue #51).
             self.logger.info(f'Undock failure ({reason}); not retriable on Kachaka side')
+            return False
+        if reason is not None and reason.startswith(('precheck_', 'physical_')):
+            # Shelf dock/undock failures (Issue #57): re-running a dock/undock
+            # could lift or drop a shelf a second time.
+            self.logger.info(f'Shelf failure ({reason}); not retriable on Kachaka side')
             return False
         # Negative error codes are internal signals to RMF (replan); never retry on Kachaka side.
         if error_code < 0:
@@ -1921,7 +1958,7 @@ class KachakaApiClientByZenoh:
                     method_name = self.method_mapping.get(method_name, method_name)
                     self.task_id = new_task_id
 
-                    if not hasattr(self.kachaka_client, method_name):
+                    if method_name not in self.SHELF_METHODS and not hasattr(self.kachaka_client, method_name):
                         raise AttributeError(f'Invalid method: {method_name}')
 
                     self._log_info(f'Executing command: {method_name} (ID: {self.task_id})')
@@ -1946,6 +1983,8 @@ class KachakaApiClientByZenoh:
                     self.expected_kachaka_method = None
                     self.command_target_map_name = None
                     self.command_target_pose = None
+                    self._shelf_method = None
+                    self._dry_run_shelf = None
                     self._ignored_result_count = 0
                     if not is_retry:
                         self.retry_count = 0
@@ -1960,7 +1999,7 @@ class KachakaApiClientByZenoh:
                     # confirmed as ours; reconciling it would always
                     # misclassify the sync command's own id as external
                     # (Codex re-review ISS34-040 blocking-B).
-                    is_async_dispatch = method_name in ('move_to_pose', 'return_home')
+                    is_async_dispatch = method_name in ('move_to_pose', 'return_home') + self.SHELF_METHODS
 
                 try:
                     # Heavy gRPC work: outside _command_lock, guarded by dispatching.
@@ -2017,6 +2056,8 @@ class KachakaApiClientByZenoh:
                     elif method_name == 'return_home':
                         self.expected_kachaka_method = 'return_home'
                         self._execute_async_stub_dispatch(method_name, command['args'], task_id=new_task_id)
+                    elif method_name in self.SHELF_METHODS:
+                        self._execute_shelf_command(method_name, command['args'], new_task_id)
                     else:
                         self.logger.debug(f'{method_name} args: {command["args"]}')
                         self._execute_sync_method(method_name, command['args'], task_id=new_task_id)
@@ -2207,6 +2248,95 @@ class KachakaApiClientByZenoh:
         self._publish_command_completion(success=True, error_code=0, task_id=task_id)
         return True
 
+    def _shelf_precheck(self, args: Dict[str, Any]) -> tuple:
+        """Validate a shelf_* command before any shelf API is called (Issue #57).
+
+        Extension point for the position / carrying-state prechecks of
+        Issue #58: add further checks here, returning a precheck_* reason.
+
+        Returns:
+            (reason, location_id): reason is a precheck_* string when the
+                command must be rejected, else None.
+        """
+        if self.shelf_driver is None:
+            return 'precheck_no_shelf_driver', None
+        if self.shelf_driver not in self.SHELF_DRIVERS:
+            return 'precheck_invalid_shelf_driver', None
+        location = args.get('location')
+        if not isinstance(location, str) or not location or not isinstance(args.get('forward', False), bool):
+            return 'precheck_invalid_args', None
+        try:
+            locations = self.kachaka_client.stub.GetLocations(pb2.GetRequest(),
+                                                              timeout=self.grpc_status_check_timeout).locations
+        except RpcError as e:
+            self._log_error('RPC', '_shelf_precheck', e)
+            return 'precheck_location_unavailable', None
+        location_id = next((loc.id for loc in locations if location in (loc.id, loc.name)), None)
+        if location_id is None:
+            return 'precheck_unknown_location', None
+        return None, location_id
+
+    def _execute_shelf_command(self, method_name: str, args: Dict[str, Any], task_id: Optional[str]) -> None:
+        """Run shelf_dock / shelf_undock with the configured shelf_driver (Issue #57).
+
+        pro / standard go through the same async stub path as move_to_pose
+        (command_id bind, watchdog, timeouts, cancel). dry_run calls no shelf
+        API and completes from publish_result() after shelf_dry_run_duration.
+        """
+        reason, location_id = self._shelf_precheck(args)
+        if reason is not None:
+            self._log_warning(f'{method_name} {task_id} rejected: {reason}')
+            self._publish_command_completion(success=False, error_code=-1, task_id=task_id, reason=reason)
+            return
+        if self.shelf_driver == 'dry_run':
+            with self._command_lock:
+                self._dry_run_shelf = (method_name, time.monotonic() + self.shelf_dry_run_duration)
+            self._log_info(f'dry_run {method_name} {task_id} accepted (location={location_id})')
+            return
+        if method_name == 'shelf_undock':
+            kachaka_method, kachaka_args = 'undock_shelf', {}
+        elif self.shelf_driver == 'pro':
+            kachaka_method = 'dock_any_shelf_with_registration'
+            kachaka_args = {'target_location_id': location_id, 'dock_forward': args.get('forward', False)}
+        else:
+            kachaka_method, kachaka_args = 'dock_shelf', {}
+        with self._command_lock:
+            self._shelf_method = method_name
+            self.expected_kachaka_method = kachaka_method
+        self._execute_async_stub_dispatch(kachaka_method, kachaka_args, task_id=task_id)
+
+    def _shelf_physical_check(self, success: bool, reason: Optional[str]) -> tuple:
+        """Confirm a finished pro/standard shelf command with get_moving_shelf_id() (Issue #57).
+
+        Any failure after the shelf API was issued is reported as physical_*.
+        Issue #58 adds the shelf-ID match (physical_shelf_mismatch) here.
+        """
+        if not success:
+            return False, reason or 'physical_command_failed'
+        try:
+            shelf_id = self.kachaka_client.stub.GetMovingShelfId(pb2.GetRequest(),
+                                                                 timeout=self.grpc_status_check_timeout).shelf_id
+        except RpcError as e:
+            self._log_error('RPC', '_shelf_physical_check', e)
+            return False, 'physical_shelf_state_unknown'
+        if self._shelf_method == 'shelf_dock' and not shelf_id:
+            return False, 'physical_shelf_not_docked'
+        if self._shelf_method == 'shelf_undock' and shelf_id:
+            return False, 'physical_shelf_still_docked'
+        return True, None
+
+    def _advance_dry_run_shelf(self) -> None:
+        """Publish progress or completion of the active dry_run shelf command. Caller holds _command_lock."""
+        method_name, finish_at = self._dry_run_shelf
+        task_id = self.task_id
+        if time.monotonic() < finish_at:
+            result = CommandCompletion(task_id=task_id, is_completed=False, success=None, error_code=None)
+            self.last_command_result = result
+            self._publish_to_zenoh(self.command_is_completed_pub, result.as_payload())
+            return
+        if self._publish_command_completion(success=True, error_code=0, task_id=task_id):
+            self._dry_run_carrying = method_name == 'shelf_dock'
+
     @staticmethod
     def _extract_command_result(response: Any) -> Optional[Dict[str, Any]]:  # noqa: ANN401
         """Return the command Result dict from a method response, or None.
@@ -2255,6 +2385,15 @@ class KachakaApiClientByZenoh:
             ))
         elif method_name == 'return_home':
             command = pb2.Command(return_home_command=pb2.ReturnHomeCommand())
+        elif method_name == 'dock_shelf':
+            command = pb2.Command(dock_shelf_command=pb2.DockShelfCommand())
+        elif method_name == 'undock_shelf':
+            command = pb2.Command(undock_shelf_command=pb2.UndockShelfCommand())
+        elif method_name == 'dock_any_shelf_with_registration':
+            command = pb2.Command(dock_any_shelf_with_registration_command=pb2.DockAnyShelfWithRegistrationCommand(
+                target_location_id=args.get('target_location_id', ''),
+                dock_forward=args.get('dock_forward', False),
+            ))
         else:
             raise ValueError(f'Unsupported stub dispatch method: {method_name}')
         return pb2.StartCommandRequest(command=command, cancel_all=args.get('cancel_all', True))
@@ -2482,6 +2621,8 @@ class KachakaApiClientByZenoh:
         self.command_target_map_name = None
         self.command_target_pose = None
         self._undock = None
+        self._shelf_method = None
+        self._dry_run_shelf = None
 
     def _reconstruct_kachaka_client(self) -> bool:
         """Recreate the KachakaApiClient to recover from a dead gRPC channel.

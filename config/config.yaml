@@ -62,6 +62,15 @@ navigation_retry:
   retry_on_error_types:     # Error types that trigger automatic retry
     - Error                 # Retriable errors (may succeed on retry)
 
+# Shelf dock/undock driver for the shelf_dock / shelf_undock commands (Issue #57).
+#   pro      : shelf_dock -> dock_any_shelf_with_registration(location, forward), shelf_undock -> undock_shelf()
+#   standard : shelf_dock -> dock_shelf(),                                       shelf_undock -> undock_shelf()
+#   dry_run  : no shelf API is called; only a simulated carrying state changes (development / integration tests)
+# No default: while unset, shelf_* commands fail with reason=precheck_no_shelf_driver.
+# shelf_driver: pro
+# dry_run only: seconds a shelf command stays in progress before it succeeds.
+shelf_dry_run_duration: 0.0
+
 # Optional: Custom Zenoh config file path.
 # Use this to enable mTLS against the Zenoh router; see
 # config/zenoh_client_mtls.json5.example and set the router address with the

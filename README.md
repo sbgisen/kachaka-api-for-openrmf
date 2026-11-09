@@ -154,6 +154,20 @@ connection:
   max_consecutive_errors: 10 # Error threshold before exit
 ```
 
+**Shelf Driver** - Selects how `shelf_dock` / `shelf_undock` are executed. There is no default; while it is unset, shelf commands fail with `reason=precheck_no_shelf_driver`:
+```yaml
+shelf_driver: pro             # pro | standard | dry_run
+shelf_dry_run_duration: 0.0   # dry_run only: seconds before the simulated command succeeds
+```
+
+| `shelf_driver` | `shelf_dock` | `shelf_undock` |
+|---|---|---|
+| `pro` | `dock_any_shelf_with_registration(location, forward)` | `undock_shelf()` |
+| `standard` | `dock_shelf()` | `undock_shelf()` |
+| `dry_run` | no API call, simulated carrying = true | no API call, simulated carrying = false |
+
+Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, default false)}`, `shelf_undock` takes `{"location": str}`. `location` is matched against the id or name of `get_locations()`. Failures carry a `reason`: `precheck_*` means no shelf API was called, `physical_*` means it failed after the API was issued.
+
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 
 #### Connecting to an mTLS router

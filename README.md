@@ -230,7 +230,7 @@ shelf_precheck:
 | `shelf_undock`, empty, another shelf or no shelf at the location | `precheck_unknown` |
 | robot pose / shelf state could not be read | `precheck_state_unavailable` |
 
-In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised).
+In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised). A dry_run re-run of `shelf_undock` compares the remembered shelf id (`shelf_dry_run_shelf_id`, the shelf `get_shelves()` showed before the dock, or `dry_run_shelf`) with the real `get_shelves()`, so it can end in `precheck_unknown`.
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 

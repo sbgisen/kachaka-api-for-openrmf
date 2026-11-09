@@ -716,6 +716,26 @@ def test_rerun_undock_with_another_shelf_at_location_is_unknown() -> None:
     assert published_payloads(node)[-1] == rejected('cmd-undock-again', 'precheck_unknown')[0]
 
 
+def test_rerun_undock_of_remembered_shelf_at_another_location_is_unknown() -> None:
+    """The memory is (location, shelf): the same shelf found at another location does not match."""
+    node = dry_run_dock_and_undock_at_a1()
+    node.kachaka_client.stub.GetShelves.return_value = SimpleNamespace(
+        shelves=[SimpleNamespace(id='S1', pose=pose(1.0, 0.95))])
+    place_robot(node, pose(1.0, 0.95))
+    node._execute_command(undock(task_id='cmd-undock-a2', location='a2'))
+    assert published_payloads(node)[-1] == rejected('cmd-undock-a2', 'precheck_unknown')[0]
+
+
+def test_placed_shelf_memory_survives_a_dock() -> None:
+    """A successful dock does not clear the memory, so it never falls back to the looser no-memory check."""
+    node = dry_run_dock_and_undock_at_a1()
+    place_robot(node, IN_FRONT_OF_A1)
+    node._execute_command(dock(task_id='cmd-dock-again'))
+    asyncio.run(node.publish_result())
+    assert published_payloads(node)[-1] == {'id': 'cmd-dock-again', 'is_completed': True, 'success': True}
+    assert node._placed_shelf == ('loc-a1', 'S1')
+
+
 def test_rerun_undock_without_memory_accepts_any_shelf_at_location() -> None:
     node = make_shelf_node('dry_run')
     place_robot(node, AT_A1)

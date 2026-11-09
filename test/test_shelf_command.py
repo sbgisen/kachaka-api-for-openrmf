@@ -678,3 +678,48 @@ def test_dry_run_undock_clears_carried_shelf_memory() -> None:
     asyncio.run(node.publish_result())
     assert published_payloads(node)[-1] == {'id': 'cmd-undock', 'is_completed': True, 'success': True}
     assert node._carried_shelf is None
+
+
+def dry_run_dock_and_undock_at_a1() -> object:
+    """Dock S1 at a1 and undock it there again, so the bridge remembers (loc-a1, S1)."""
+    node = make_shelf_node('dry_run')
+    node._execute_command(dock())
+    asyncio.run(node.publish_result())
+    place_robot(node, AT_A1)
+    node._execute_command(undock())
+    asyncio.run(node.publish_result())
+    return node
+
+
+def test_undock_remembers_placed_shelf() -> None:
+    node = make_shelf_node('standard', carrying='S1')
+    node._execute_command(undock())
+    finish_on_robot(node, 'undockShelfCommand')
+    node.kachaka_client.stub.GetMovingShelfId.return_value = SimpleNamespace(shelf_id='')
+    asyncio.run(node.publish_result())
+    assert published_payloads(node) == [{'id': 'cmd-undock', 'is_completed': True, 'success': True}]
+    assert node._placed_shelf == ('loc-a1', 'S1')
+
+
+def test_rerun_undock_with_remembered_shelf_at_location_succeeds() -> None:
+    node = dry_run_dock_and_undock_at_a1()
+    node._execute_command(undock(task_id='cmd-undock-again'))
+    assert published_payloads(node)[-1] == {'id': 'cmd-undock-again', 'is_completed': True, 'success': True}
+    assert node._dry_run_shelf is None
+
+
+def test_rerun_undock_with_another_shelf_at_location_is_unknown() -> None:
+    node = dry_run_dock_and_undock_at_a1()
+    node.kachaka_client.stub.GetShelves.return_value = SimpleNamespace(
+        shelves=[SimpleNamespace(id='S2', pose=pose(1.0, 0.0))])
+    node._execute_command(undock(task_id='cmd-undock-again'))
+    assert published_payloads(node)[-1] == rejected('cmd-undock-again', 'precheck_unknown')[0]
+
+
+def test_rerun_undock_without_memory_accepts_any_shelf_at_location() -> None:
+    node = make_shelf_node('dry_run')
+    place_robot(node, AT_A1)
+    node.kachaka_client.stub.GetShelves.return_value = SimpleNamespace(
+        shelves=[SimpleNamespace(id='S2', pose=pose(1.0, 0.0))])
+    node._execute_command(undock())
+    assert published_payloads(node) == [{'id': 'cmd-undock', 'is_completed': True, 'success': True}]

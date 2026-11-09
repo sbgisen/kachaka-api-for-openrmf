@@ -182,10 +182,15 @@ Reasons a command can fail with, from this bridge (shelf commands and `move_to_p
 | `precheck_invalid_args` | `location` is not a non-empty string, or `forward` is not a bool |
 | `precheck_location_unavailable` | `get_locations()` failed |
 | `precheck_unknown_location` | `location` matches no Kachaka location |
+| `precheck_not_in_front` | dock: not in front of the location; undock: carrying but not at the location |
+| `precheck_already_carrying_other` | dock while carrying another shelf (or away from the location) |
+| `precheck_unknown` | undock while empty, and the location has no shelf, or not the shelf this bridge last undocked |
+| `precheck_state_unavailable` | the robot pose or the shelf state could not be read |
 | `physical_command_failed` | Kachaka reported the shelf command as failed |
 | `physical_shelf_not_docked` | dock reported success but `get_moving_shelf_id()` is empty |
 | `physical_shelf_still_docked` | undock reported success but `get_moving_shelf_id()` is not empty |
 | `physical_shelf_state_unknown` | `get_moving_shelf_id()` failed after the command finished |
+| `physical_shelf_mismatch` | dock picked up another shelf than `get_shelves()` showed at the location |
 | `external_busy` | rejected while a command started outside this bridge is running |
 | `external_preempted` | preempted by a `returnHome` started outside this bridge |
 | `start_timeout` | no RUNNING within `timeouts.command_start` |
@@ -221,8 +226,8 @@ shelf_precheck:
 | `shelf_dock`, carrying any other shelf | `precheck_already_carrying_other` |
 | `shelf_dock` finished with another shelf than `get_shelves()` showed at the location | `physical_shelf_mismatch` |
 | `shelf_undock`, carrying, not at the location | `precheck_not_in_front` |
-| `shelf_undock`, empty, a shelf at the location | `success: true`, no API call |
-| `shelf_undock`, empty, no shelf at the location | `precheck_unknown` |
+| `shelf_undock`, empty, the shelf this bridge last undocked is at the location (or any shelf after a restart) | `success: true`, no API call |
+| `shelf_undock`, empty, another shelf or no shelf at the location | `precheck_unknown` |
 | robot pose / shelf state could not be read | `precheck_state_unavailable` |
 
 In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised).

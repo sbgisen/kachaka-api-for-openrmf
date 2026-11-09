@@ -263,14 +263,19 @@ class KachakaApiClientByZenoh:
     shelf_at_location_tolerance = 0.3
     shelf_match_radius = 0.3
     # Shelf expected under the robot after the active dock (from
-    # get_shelves() before the dock; None when no shelf is registered there)
-    # and the dock location ID. Cleared with _shelf_method.
+    # get_shelves() before the dock; None when no shelf is registered there),
+    # or the shelf carried before the active undock, and the location ID of
+    # the command. Cleared with _shelf_method.
     _expected_shelf_id: Optional[str] = None
     _shelf_location_id: Optional[str] = None
     # (location_id, shelf_id) of the shelf this bridge docked, location_id
     # None after a mismatch. Memory only: after a restart the already-docked
     # check falls back to the robot position (Issue #58 item 4).
     _carried_shelf: Optional[tuple] = None
+    # (location_id, shelf_id) of the last shelf this bridge undocked. A re-run
+    # undock succeeds only if that shelf is at the location. Memory only:
+    # after a restart any shelf at the location counts (Issue #58 item 4).
+    _placed_shelf: Optional[tuple] = None
 
     # Allowed range for undock.distance_m: 1.0m would overshoot the 0.95m
     # spacing between two adjacent docks, and anything at or below
@@ -2357,7 +2362,8 @@ class KachakaApiClientByZenoh:
                 to reject with. done=True means the requested state already
                 holds (RMF re-running a finished action) and the command
                 succeeds without any shelf API call. expected_shelf_id is the
-                shelf a dock must pick up, None when none is registered there.
+                shelf a dock must pick up (None when none is registered there),
+                or the shelf an undock puts down.
         """
         try:
             moving_id = self._moving_shelf_id()
@@ -2369,8 +2375,10 @@ class KachakaApiClientByZenoh:
             at_location = distance <= self.shelf_at_location_tolerance
             if method_name == 'shelf_undock':
                 if moving_id:
-                    return (None if at_location else 'precheck_not_in_front'), False, None
-                if self._shelf_at_location(location) is not None:
+                    return (None if at_location else 'precheck_not_in_front'), False, moving_id
+                shelf_id = self._shelf_at_location(location)
+                # Without memory (bridge restarted) any shelf at the location is the evidence.
+                if shelf_id is not None and self._placed_shelf in (None, (location.id, shelf_id)):
                     return None, True, None
                 return 'precheck_unknown', False, None
             if moving_id:
@@ -2439,6 +2447,7 @@ class KachakaApiClientByZenoh:
         """
         if method_name == 'shelf_undock':
             self._carried_shelf = None
+            self._placed_shelf = (self._shelf_location_id, self._expected_shelf_id)
             return True, None
         if self._expected_shelf_id is not None and shelf_id != self._expected_shelf_id:
             self._log_error_msg(f'Docked shelf {shelf_id} is not the expected {self._expected_shelf_id}')

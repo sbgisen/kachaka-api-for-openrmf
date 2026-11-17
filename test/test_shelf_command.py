@@ -600,6 +600,13 @@ def test_shelf_precheck_config_keeps_defaults_for_missing_keys() -> None:
     assert node.shelf_at_location_tolerance == 0.5
 
 
+def test_shipped_config_shelf_precheck_tolerances_are_half_a_meter() -> None:
+    config_file = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    section = yaml.safe_load(config_file.read_text())['shelf_precheck']
+    assert section['at_location_tolerance'] == 0.5
+    assert section['match_radius'] == 0.5
+
+
 @pytest.mark.parametrize('section, key', [
     (None, 'shelf_precheck'),
     ({

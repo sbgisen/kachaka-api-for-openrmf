@@ -212,8 +212,8 @@ shelf_precheck:
   front_distance_max: 1.2
   front_yaw_tolerance: 0.35   # rad, shelf_dock: |bearing to the location - (robot yaw + offset)|
   front_yaw_offset: 0.0       # rad, set pi if the robot backs into the shelf
-  at_location_tolerance: 0.3  # m, robot-to-location distance while carrying
-  match_radius: 0.3           # m, a get_shelves() shelf this close is at the location
+  at_location_tolerance: 0.5  # m, robot-to-location distance while carrying
+  match_radius: 0.5           # m, a get_shelves() shelf this close is at the location
 # shelf_dry_run_shelf_id: S2  # dry_run only: shelf a simulated dock picks up (reproduces physical_shelf_mismatch)
 ```
 

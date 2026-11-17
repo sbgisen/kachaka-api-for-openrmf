@@ -55,6 +55,7 @@ LOCATIONS = [
 SHELVES = [SimpleNamespace(id='S1', pose=pose(1.0, 0.0)), SimpleNamespace(id='S2', pose=pose(1.0, 0.95))]
 IN_FRONT_OF_A1 = pose(0.5, 0.0)
 AT_A1 = pose(1.0, 0.0)
+AWAY_FROM_A1 = pose(0.3, 0.0)  # 0.7 m from A1, beyond the 0.5 m at_location_tolerance
 
 
 def make_shelf_node(driver: object, carrying: str = '') -> object:
@@ -360,7 +361,7 @@ def test_front_yaw_offset_allows_backing_in() -> None:
 @pytest.mark.parametrize('driver', ['standard', 'dry_run'])
 def test_undock_away_from_location_is_rejected(driver: str) -> None:
     node = make_shelf_node(driver, carrying='S1')
-    place_robot(node, IN_FRONT_OF_A1)
+    place_robot(node, AWAY_FROM_A1)
     node._execute_command(undock())
     assert published_payloads(node) == rejected('cmd-undock', 'precheck_not_in_front')
     node.kachaka_client.stub.StartCommand.assert_not_called()
@@ -377,7 +378,7 @@ def test_dock_while_carrying_another_shelf_is_rejected(driver: str) -> None:
 
 def test_dock_while_carrying_away_from_location_is_rejected_after_restart() -> None:
     node = make_shelf_node('dry_run', carrying='S1')
-    place_robot(node, IN_FRONT_OF_A1)
+    place_robot(node, AWAY_FROM_A1)
     node._execute_command(dock())
     assert published_payloads(node) == rejected('cmd-dock', 'precheck_already_carrying_other')
 
@@ -595,7 +596,8 @@ def test_shelf_precheck_config_keeps_defaults_for_missing_keys() -> None:
     node = make_node()
     node._load_shelf_precheck_config({})
     assert node.shelf_front_distance_max == 1.2
-    assert node.shelf_match_radius == 0.3
+    assert node.shelf_match_radius == 0.5
+    assert node.shelf_at_location_tolerance == 0.5
 
 
 @pytest.mark.parametrize('section, key', [
@@ -624,7 +626,7 @@ def test_shelf_precheck_config_rejects_bad_values(section: object, key: str) -> 
     node = make_node()
     with pytest.raises(ValueError, match=key):
         node._load_shelf_precheck_config(section)
-    assert node.shelf_match_radius == 0.3  # nothing applied
+    assert node.shelf_match_radius == 0.5  # nothing applied
 
 
 # Exactly representable in binary, so the boundary comparisons are stable.

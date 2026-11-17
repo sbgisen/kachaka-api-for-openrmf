@@ -260,8 +260,8 @@ class KachakaApiClientByZenoh:
     shelf_front_distance_max = 1.2
     shelf_front_yaw_tolerance = 0.35
     shelf_front_yaw_offset = 0.0
-    shelf_at_location_tolerance = 0.3
-    shelf_match_radius = 0.3
+    shelf_at_location_tolerance = 0.5
+    shelf_match_radius = 0.5
     # Shelf expected under the robot after the active dock (from
     # get_shelves() before the dock; None when no shelf is registered there),
     # or the shelf carried before the active undock, and the location ID of

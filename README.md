@@ -61,7 +61,7 @@ curl http://$KACHAKA_IP:26502/kachaka/get_map_list
 # {"get_map_list":[{"name":"1F","id":"XXX"},{"name":"2F","id":"YYY"}]}
 ```
 
-If `curl` cannot connect, log in to the Playground (`ssh -p 26500 kachaka@$KACHAKA_IP`), check the bridge log `~/kachaka_api.log` (`/tmp/kachaka_startup.log` only holds the standard output of the startup script), and make sure `python3 -c "import kachaka_api, fastapi, uvicorn"` succeeds.
+If `curl` cannot connect, log in to the Playground (`ssh -p 26500 kachaka@$KACHAKA_IP`), check the bridge log `~/kachaka_api.log` (a path relative to the directory the startup script is launched from, normally `~`; `/tmp/kachaka_startup.log` only holds the standard output of the startup script), and make sure `python3 -c "import kachaka_api, fastapi, uvicorn"` succeeds.
 
 ## Local development
 

@@ -173,7 +173,7 @@ Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, d
 
 `dry_run` simulates only the shelf API. Movement and other commands still reach the robot. A `cancel_command` is simulated (the robot's `cancel_command` is not called) only while a simulated shelf command is in progress; any other cancel is sent to the robot as usual.
 
-Reasons a command can fail with, from this bridge (shelf commands and `move_to_pose`) and from the adapter. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
+Reasons a command can fail with, from this bridge (shelf commands, `switch_map` while carrying a shelf, and `move_to_pose`) and from the adapter. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
 
 | reason | Raised when |
 |---|---|
@@ -185,12 +185,13 @@ Reasons a command can fail with, from this bridge (shelf commands and `move_to_p
 | `precheck_not_in_front` | dock: not in front of the location; undock: carrying but not at the location |
 | `precheck_already_carrying_other` | dock while carrying another shelf (or away from the location) |
 | `precheck_unknown` | undock while empty, and the location has no shelf, or not the shelf this bridge last undocked |
-| `precheck_state_unavailable` | the robot pose or the shelf state could not be read |
+| `precheck_state_unavailable` | the robot pose or the shelf state could not be read (shelf commands, and `switch_map` with `shelf_driver` set) |
 | `physical_command_failed` | Kachaka reported the shelf command as failed |
 | `physical_shelf_not_docked` | dock reported success but `get_moving_shelf_id()` is empty |
 | `physical_shelf_still_docked` | undock reported success but `get_moving_shelf_id()` is not empty |
 | `physical_shelf_state_unknown` | `get_moving_shelf_id()` failed after the command finished |
 | `physical_shelf_mismatch` | dock picked up another shelf than `get_shelves()` showed at the location |
+| `carrying_on_standard` | `switch_map` to another map while carrying a shelf with `shelf_driver` `standard` / `dry_run` (`switch_map` is not called) |
 | `external_busy` | rejected while a command started outside this bridge is running |
 | `external_preempted` | preempted by a `returnHome` started outside this bridge |
 | `start_timeout` | no RUNNING within `timeouts.command_start` |
@@ -231,6 +232,15 @@ shelf_precheck:
 | robot pose / shelf state could not be read | `precheck_state_unavailable` |
 
 In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised). A dry_run re-run of `shelf_undock` compares the remembered shelf id (`shelf_dry_run_shelf_id`, the shelf `get_shelves()` showed before the dock, or `dry_run_shelf`) with the real `get_shelves()`, so it can end in `precheck_unknown`.
+
+`switch_map` to another map also checks `get_moving_shelf_id()` (the simulated ID in dry_run) when `shelf_driver` is set. Without `shelf_driver` it behaves as before.
+
+| Case | Result |
+|---|---|
+| empty | switches without inherit |
+| carrying, `pro` | switches with `inherit_docking_state_and_docked_shelf: true` |
+| carrying, `standard` / `dry_run` | `carrying_on_standard`, `switch_map` is not called |
+| carrying state could not be read | `precheck_state_unavailable` |
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 

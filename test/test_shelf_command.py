@@ -593,9 +593,11 @@ def test_shelf_precheck_config_values_are_applied() -> None:
         assert getattr(node, f'shelf_{key}') == value
 
 
-def test_shelf_precheck_config_keeps_defaults_for_missing_keys() -> None:
+@pytest.mark.parametrize('section', [{}, None])
+def test_shelf_precheck_config_keeps_defaults_for_missing_keys(section: object) -> None:
+    # None is an empty `shelf_precheck:` key in the YAML.
     node = make_node()
-    node._load_shelf_precheck_config({})
+    node._load_shelf_precheck_config(section)
     assert node.shelf_front_distance_max == 1.2
     assert node.shelf_match_radius == 0.5
     assert node.shelf_at_location_tolerance == 0.5
@@ -609,7 +611,7 @@ def test_shipped_config_shelf_precheck_tolerances_are_half_a_meter() -> None:
 
 
 @pytest.mark.parametrize('section, key', [
-    (None, 'shelf_precheck'),
+    (['front_yaw_tolerance'], 'shelf_precheck'),
     ({
         'front_yaw_tolerance': 'abc'
     }, 'front_yaw_tolerance'),

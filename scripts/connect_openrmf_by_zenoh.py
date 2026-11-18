@@ -832,6 +832,9 @@ class KachakaApiClientByZenoh:
 
     def _load_shelf_precheck_config(self, section: Optional[Dict[str, Any]]) -> None:
         """Load and validate the shelf_precheck section (Issue #58); raise ValueError on a bad value."""
+        if section is None:
+            # `shelf_precheck:` with no keys under it loads as None; keep the defaults.
+            section = {}
         if not isinstance(section, dict):
             raise ValueError(f'shelf_precheck must be a mapping, got {section!r}')
         values = {}

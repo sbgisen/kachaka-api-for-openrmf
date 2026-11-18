@@ -34,7 +34,6 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
-from connect_openrmf_by_zenoh import KachakaApiClientByZenoh  # noqa: E402
 import connect_openrmf_by_zenoh  # noqa: E402
 from test_command_lifecycle import FakeRpcError  # noqa: E402
 from test_command_lifecycle import make_node  # noqa: E402
@@ -241,7 +240,8 @@ def test_shelf_driver_comes_from_config_without_default(tmp_path: Path, config: 
     config_file.write_text(yaml.safe_dump(config))
     with patch.object(connect_openrmf_by_zenoh, 'zenoh'), \
             patch.object(connect_openrmf_by_zenoh, 'KachakaApiClientWithKeepalive'):
-        node = KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447', config_file=str(config_file))
+        node = connect_openrmf_by_zenoh.KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447',
+                                                                config_file=str(config_file))
     assert node.shelf_driver == expected
     if expected is None:
         shelf_node = make_shelf_node(node.shelf_driver)
@@ -380,7 +380,8 @@ def test_command_completion_timeout_defaults_to_180_without_config(tmp_path: Pat
     config_file.write_text(yaml.safe_dump({}))
     with patch.object(connect_openrmf_by_zenoh, 'zenoh'), \
             patch.object(connect_openrmf_by_zenoh, 'KachakaApiClientWithKeepalive'):
-        node = KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447', config_file=str(config_file))
+        node = connect_openrmf_by_zenoh.KachakaApiClientByZenoh(zenoh_router='127.0.0.1:7447',
+                                                                config_file=str(config_file))
     assert node.command_completion_timeout == 180.0
 
 

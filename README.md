@@ -61,7 +61,7 @@ curl http://$KACHAKA_IP:26502/kachaka/get_map_list
 # {"get_map_list":[{"name":"1F","id":"XXX"},{"name":"2F","id":"YYY"}]}
 ```
 
-If `curl` cannot connect, log in to the Playground (`ssh -p 26500 kachaka@$KACHAKA_IP`), check `/tmp/kachaka_startup.log`, and make sure `python3 -c "import kachaka_api, fastapi, uvicorn"` succeeds.
+If `curl` cannot connect, log in to the Playground (`ssh -p 26500 kachaka@$KACHAKA_IP`), check the bridge log `~/kachaka_api.log` (a path relative to the directory the startup script is launched from, normally `~`; `/tmp/kachaka_startup.log` only holds the standard output of the startup script), and make sure `python3 -c "import kachaka_api, fastapi, uvicorn"` succeeds.
 
 ## Local development
 
@@ -144,6 +144,7 @@ map_name_mapping:
 timeouts:
   command_query: 2.0        # Command query timeout in seconds
   grpc_connection: 5        # gRPC connection retry interval
+  command_completion: 180.0 # Watchdog: fail a command with no RUNNING/completion for this long
 
 intervals:
   command_check: 4.0        # Command polling interval in seconds
@@ -153,6 +154,51 @@ connection:
   max_retries: 20           # Maximum gRPC connection retries
   max_consecutive_errors: 10 # Error threshold before exit
 ```
+
+`timeouts.command_completion` defaults to 180.0 s. Keep it shorter than the adapter's completion wait (240 s by default), so the bridge's watchdog fails the command before the adapter gives up on it.
+
+**Shelf Driver** - Selects how `shelf_dock` / `shelf_undock` are executed. There is no default; while it is unset, shelf commands fail with `reason=precheck_no_shelf_driver`:
+```yaml
+shelf_driver: pro             # pro | standard | dry_run
+shelf_dry_run_duration: 0.0   # dry_run only: seconds before the simulated command succeeds
+```
+
+| `shelf_driver` | `shelf_dock` | `shelf_undock` |
+|---|---|---|
+| `pro` | `dock_any_shelf_with_registration(location, forward)` | `undock_shelf()` |
+| `standard` | `dock_shelf()` | `undock_shelf()` |
+| `dry_run` | no API call, simulated carrying = true | no API call, simulated carrying = false |
+
+Command args: `shelf_dock` takes `{"location": str, "forward": bool (optional, default false)}`, `shelf_undock` takes `{"location": str}`. `location` is matched against the id or name of `get_locations()`. Failures carry a `reason`: `precheck_*` means no shelf API was called, `physical_*` means it failed after the API was issued. Any other failure of a shelf command (e.g. `start_timeout`, `progress_timeout`, `external_preempted`) may also come after the API was issued, so treat every failure not starting with `precheck_` as shelf state unknown. A failure with no `reason` (from existing paths such as a rejected `StartCommand`, supersede, or the watchdog) is treated by the adapter as physical state unknown.
+
+`dry_run` simulates only the shelf API. Movement and other commands still reach the robot. A `cancel_command` is simulated (the robot's `cancel_command` is not called) only while a simulated shelf command is in progress; any other cancel is sent to the robot as usual.
+
+Reasons a command can fail with, from this bridge (shelf commands and `move_to_pose`) and from the adapter. They are labels for diagnosis: robot_control cancels the task, stops the robot where it is and decommissions it on every failure (#90, agreed on 2026-11-06), so the reason does not change how a failure is handled.
+
+| reason | Raised when |
+|---|---|
+| `precheck_no_shelf_driver` | `shelf_driver` is not set |
+| `precheck_invalid_shelf_driver` | `shelf_driver` is not `pro` / `standard` / `dry_run` |
+| `precheck_invalid_args` | `location` is not a non-empty string, or `forward` is not a bool |
+| `precheck_location_unavailable` | `get_locations()` failed |
+| `precheck_unknown_location` | `location` matches no Kachaka location |
+| `physical_command_failed` | Kachaka reported the shelf command as failed |
+| `physical_shelf_not_docked` | dock reported success but `get_moving_shelf_id()` is empty |
+| `physical_shelf_still_docked` | undock reported success but `get_moving_shelf_id()` is not empty |
+| `physical_shelf_state_unknown` | `get_moving_shelf_id()` failed after the command finished |
+| `external_busy` | rejected while a command started outside this bridge is running |
+| `external_preempted` | preempted by a `returnHome` started outside this bridge |
+| `start_timeout` | no RUNNING within `timeouts.command_start` |
+| `progress_timeout` | no pose change within `timeouts.motion_progress` while RUNNING |
+| `missing_command_id` | `StartCommand` returned no command id |
+| `map_mismatch` | `move_to_pose` only: the robot is not on the requested map, or the map could not be read |
+| `undock_endpoint_rejected` | `move_to_pose` only: the undock endpoint is too close to another charger or too far from every lane |
+| `undock_failed` | `move_to_pose` only: Kachaka reported the undock move as failed |
+| `undock_start_timeout` | `move_to_pose` only: no RUNNING of the undock move within `undock.timeouts.start` |
+| `undock_progress_timeout` | `move_to_pose` only: no pose change of the undock move within `undock.timeouts.progress` |
+| `undock_phase_timeout` | `move_to_pose` only: the undock phase exceeded `undock.timeouts.phase_total` |
+| `physical_state_unknown` | set by the adapter, not this bridge: a failure that came without a `reason` |
+| `adapter_completion_timeout` | set by the adapter, not this bridge: no completion within the adapter's wait limit |
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 

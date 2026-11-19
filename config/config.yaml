@@ -18,6 +18,9 @@ timeouts:
   grpc_telemetry: 5.0       # Timeout for telemetry gRPC calls (get_robot_pose, etc.)
   grpc_status_check: 5.0    # Timeout for command status gRPC calls (GetCommandState, etc.)
   grpc_stuck: 30.0          # Threshold (sec) for treating persistent Deadline Exceeded as a stuck channel
+  # Keep command_completion shorter than the shelf action completion limit of fleet_adapter_zenoh
+  # (shelf_action.completion_timeout_sec, default 240 s). If you set it to 240 or more,
+  # change the adapter side as well.
   command_completion: 180.0 # Watchdog: force failure completion when no RUNNING/completion observed for this long
   command_start: 15.0       # Max wait for RUNNING after an async command (move_to_pose/return_home) is dispatched
   motion_progress: 30.0     # Max time with no position/yaw change while RUNNING before treated as stuck
@@ -61,6 +64,15 @@ navigation_retry:
   retry_interval: 2.0       # Wait time (seconds) before retrying
   retry_on_error_types:     # Error types that trigger automatic retry
     - Error                 # Retriable errors (may succeed on retry)
+
+# Shelf dock/undock driver for the shelf_dock / shelf_undock commands (Issue #57).
+#   pro      : shelf_dock -> dock_any_shelf_with_registration(location, forward), shelf_undock -> undock_shelf()
+#   standard : shelf_dock -> dock_shelf(),                                       shelf_undock -> undock_shelf()
+#   dry_run  : no shelf API is called; only a simulated carrying state changes (development / integration tests)
+# No default: while unset, shelf_* commands fail with reason=precheck_no_shelf_driver.
+# shelf_driver: pro
+# dry_run only: seconds a shelf command stays in progress before it succeeds.
+shelf_dry_run_duration: 0.0
 
 # Optional: Custom Zenoh config file path.
 # Use this to enable mTLS against the Zenoh router; see

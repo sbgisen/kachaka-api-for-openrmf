@@ -182,10 +182,15 @@ Reasons a command can fail with, from this bridge (shelf commands and `move_to_p
 | `precheck_invalid_args` | `location` is not a non-empty string, or `forward` is not a bool |
 | `precheck_location_unavailable` | `get_locations()` failed |
 | `precheck_unknown_location` | `location` matches no Kachaka location |
+| `precheck_not_in_front` | dock: not in front of the location; undock: carrying but not at the location |
+| `precheck_already_carrying_other` | dock while carrying another shelf (or away from the location) |
+| `precheck_unknown` | undock while empty, and the location has no shelf, or not the shelf this bridge last undocked |
+| `precheck_state_unavailable` | the robot pose or the shelf state could not be read |
 | `physical_command_failed` | Kachaka reported the shelf command as failed |
 | `physical_shelf_not_docked` | dock reported success but `get_moving_shelf_id()` is empty |
 | `physical_shelf_still_docked` | undock reported success but `get_moving_shelf_id()` is not empty |
 | `physical_shelf_state_unknown` | `get_moving_shelf_id()` failed after the command finished |
+| `physical_shelf_mismatch` | dock picked up another shelf than `get_shelves()` showed at the location |
 | `external_busy` | rejected while a command started outside this bridge is running |
 | `external_preempted` | preempted by a `returnHome` started outside this bridge |
 | `start_timeout` | no RUNNING within `timeouts.command_start` |
@@ -199,6 +204,33 @@ Reasons a command can fail with, from this bridge (shelf commands and `move_to_p
 | `undock_phase_timeout` | `move_to_pose` only: the undock phase exceeded `undock.timeouts.phase_total` |
 | `physical_state_unknown` | set by the adapter, not this bridge: a failure that came without a `reason` |
 | `adapter_completion_timeout` | set by the adapter, not this bridge: no completion within the adapter's wait limit |
+
+**Shelf Precheck** - Before calling a shelf API the bridge checks the robot position and the carrying state (Issue #58). The tolerances are shared by all drivers and are placeholders until measured:
+```yaml
+shelf_precheck:
+  front_distance_min: 0.3     # m, shelf_dock: robot-to-location distance range
+  front_distance_max: 1.2
+  front_yaw_tolerance: 0.35   # rad, shelf_dock: |bearing to the location - (robot yaw + offset)|
+  front_yaw_offset: 0.0       # rad, set pi if the robot backs into the shelf
+  at_location_tolerance: 0.5  # m, robot-to-location distance while carrying
+  match_radius: 0.5           # m, a get_shelves() shelf this close is at the location
+# shelf_dry_run_shelf_id: S2  # dry_run only: shelf a simulated dock picks up (reproduces physical_shelf_mismatch)
+```
+
+`front_yaw_offset` is a single global value and does not follow the `forward` argument of `shelf_dock`; mixing forward and backward approaches makes one of them fail with `precheck_not_in_front`.
+
+| Case | Result |
+|---|---|
+| `shelf_dock`, empty, not in front of the location | `precheck_not_in_front` |
+| `shelf_dock`, carrying the shelf this bridge docked at the location (or any shelf after a restart) and at the location | `success: true`, no API call |
+| `shelf_dock`, carrying any other shelf | `precheck_already_carrying_other` |
+| `shelf_dock` finished with another shelf than `get_shelves()` showed at the location | `physical_shelf_mismatch` |
+| `shelf_undock`, carrying, not at the location | `precheck_not_in_front` |
+| `shelf_undock`, empty, the shelf this bridge last undocked is at the location (or any shelf after a restart) | `success: true`, no API call |
+| `shelf_undock`, empty, another shelf or no shelf at the location | `precheck_unknown` |
+| robot pose / shelf state could not be read | `precheck_state_unavailable` |
+
+In dry_run the robot does not move under the shelf, so before a dry_run `shelf_undock` the robot must be at the location (or `at_location_tolerance` must be raised). A dry_run re-run of `shelf_undock` compares the remembered shelf id (`shelf_dry_run_shelf_id`, the shelf `get_shelves()` showed before the dock, or `dry_run_shelf`) with the real `get_shelves()`, so it can end in `precheck_unknown`.
 
 The queryable-based architecture polls for commands every 4 seconds by default, providing better reliability during network disconnections compared to push-based subscribers.
 
